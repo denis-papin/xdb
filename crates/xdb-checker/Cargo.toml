@@ -1,0 +1,8 @@
+[package]
+name = "xdb-checker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xdb-ir = { path = "../xdb-ir" }

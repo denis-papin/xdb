@@ -1,0 +1,11 @@
+[package]
+name = "xdb-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xdb-ir = { path = "../xdb-ir" }
+xdb-core = { path = "../xdb-core" }
+xdb-compiler = { path = "../xdb-compiler" }
+xdb-checker = { path = "../xdb-checker" }

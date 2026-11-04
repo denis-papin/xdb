@@ -1,0 +1,7 @@
+target/
+**/target/
+.git/
+bench/
+docs/
+C*Users*/
+*.log

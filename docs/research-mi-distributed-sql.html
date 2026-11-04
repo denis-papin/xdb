@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XDB Micro-Instruction Engine</title>
+<meta name="description" content="Research note: running PL/SQL-like procedures as prioritized micro-instructions over a sharded, replicated transactional store on a LAN.">
+<style>
+:root{
+  --bg:#fbfaf7; --surface:#ffffff; --surface-2:#f2f0ea; --text:#1d1c1a; --muted:#5f5b53;
+  --border:#dcd8cf; --accent:#2f5d8a; --accent-soft:#e3ecf5; --warn:#9a5b13; --warn-soft:#f8eddc;
+  --ok:#2e6b3f; --ok-soft:#e2f0e5; --bad:#9b2c2c; --bad-soft:#f7e3e3; --code-bg:#f4f2ed;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#16171a; --surface:#1e2024; --surface-2:#25282d; --text:#e8e6e1; --muted:#a19d94;
+    --border:#363a40; --accent:#8db8e3; --accent-soft:#1f2f40; --warn:#e3b06b; --warn-soft:#3a2d1b;
+    --ok:#8fcb9d; --ok-soft:#1d3324; --bad:#e99a9a; --bad-soft:#3d2222; --code-bg:#23262b;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#16171a; --surface:#1e2024; --surface-2:#25282d; --text:#e8e6e1; --muted:#a19d94;
+  --border:#363a40; --accent:#8db8e3; --accent-soft:#1f2f40; --warn:#e3b06b; --warn-soft:#3a2d1b;
+  --ok:#8fcb9d; --ok-soft:#1d3324; --bad:#e99a9a; --bad-soft:#3d2222; --code-bg:#23262b;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:16px/1.65 Georgia,"Iowan Old Style","Times New Roman",serif}
+main{max-width:860px;margin:0 auto;padding:40px 16px 96px}
+h1,h2,h3,h4{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.25;letter-spacing:-.01em}
+h1{font-size:2rem;margin:0 0 .3em}
+h2{font-size:1.4rem;margin:2.6em 0 .6em;padding-top:.6em;border-top:1px solid var(--border)}
+h3{font-size:1.1rem;margin:1.8em 0 .4em}
+h4{font-size:1rem;margin:1.4em 0 .3em}
+p,li{max-width:72ch}
+a{color:var(--accent)}
+.sub{color:var(--muted);font-family:system-ui,sans-serif;font-size:.95rem;margin:0 0 2em}
+code,pre{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-size:.86em}
+code{background:var(--code-bg);padding:.1em .35em;border-radius:4px}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow-x:auto;line-height:1.5}
+pre code{background:none;padding:0}
+.box{border:1px solid var(--border);border-left:4px solid var(--accent);background:var(--accent-soft);
+  border-radius:6px;padding:12px 16px;margin:1.2em 0}
+.box.warn{border-left-color:var(--warn);background:var(--warn-soft)}
+.box.ok{border-left-color:var(--ok);background:var(--ok-soft)}
+.box p{margin:.4em 0}
+.box strong:first-child{font-family:system-ui,sans-serif}
+.tablewrap{overflow-x:auto;margin:1em 0}
+table{border-collapse:collapse;width:100%;font-size:.92rem;font-family:system-ui,sans-serif}
+th,td{border-bottom:1px solid var(--border);padding:8px 10px;text-align:left;vertical-align:top}
+th{background:var(--surface-2);font-weight:600}
+td.n{font-variant-numeric:tabular-nums;white-space:nowrap}
+nav.toc{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 20px;font-family:system-ui,sans-serif;font-size:.93rem}
+nav.toc ol{margin:.4em 0;padding-left:1.3em}
+nav.toc li{margin:.15em 0}
+figure{margin:1.6em 0}
+figure svg{width:100%;height:auto;display:block;background:var(--surface);border:1px solid var(--border);border-radius:8px}
+figcaption{color:var(--muted);font-size:.88rem;font-family:system-ui,sans-serif;margin-top:.5em}
+svg text{font-family:system-ui,sans-serif;fill:var(--text)}
+svg .muted{fill:var(--muted)}
+svg .node{fill:var(--surface-2);stroke:var(--border);stroke-width:1.5}
+svg .acc{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5}
+svg .wrn{fill:var(--warn-soft);stroke:var(--warn);stroke-width:1.5}
+svg .okk{fill:var(--ok-soft);stroke:var(--ok);stroke-width:1.5}
+svg .line{stroke:var(--muted);stroke-width:1.5;fill:none}
+svg .dash{stroke:var(--muted);stroke-width:1.2;fill:none;stroke-dasharray:4 4}
+svg .arrowhead{fill:var(--muted)}
+.tag{display:inline-block;font-family:system-ui,sans-serif;font-size:.75rem;font-weight:600;padding:1px 8px;border-radius:999px;border:1px solid var(--border);background:var(--surface-2);color:var(--muted);vertical-align:middle}
+.tag.hi{color:var(--bad);background:var(--bad-soft);border-color:transparent}
+.tag.md{color:var(--warn);background:var(--warn-soft);border-color:transparent}
+.tag.lo{color:var(--ok);background:var(--ok-soft);border-color:transparent}
+</style>
+</head>
+<body>
+<main>
+
+<h1>Prioritized Micro-Instructions for Distributed PL/SQL</h1>
+<p class="sub">Research note · XDB project · November 2026 · Status: design exploration, nothing built yet</p>
+
+<div class="box">
+<p><strong>In one paragraph.</strong> A PL/SQL-like procedure ("the code") is compiled into a dependency graph of small, restartable <em>micro-instructions</em> (MIs). Each MI touches one shard. MIs are shipped to the node that owns the data and run there, out of order, as soon as their inputs are ready — the way a CPU issues micro-ops. Conflicts are not handled by a lock manager. Instead every transaction carries one fixed, globally ordered <em>priority</em> (its age). When two MIs collide on a record, the record's owner compares priorities: the older transaction wins, the younger one waits or is restarted. This is the classic <em>wound-wait</em> rule, and it gives serializability without deadlock detection. Replication uses one Raft group per shard; commits use a replicated two-phase commit.</p>
+</div>
+
+<nav class="toc">
+<strong>Contents</strong>
+<ol>
+<li><a href="#goals">Goals and assumptions</a></li>
+<li><a href="#arch">Architecture</a></li>
+<li><a href="#compile">From the code to micro-instructions</a></li>
+<li><a href="#exec">Execution: the database as a CPU</a></li>
+<li><a href="#prio">Concurrency control by priority</a></li>
+<li><a href="#storage">Sharding, replication and commit</a></li>
+<li><a href="#blocks">Transaction blocks inside a routine</a></li>
+<li><a href="#fail">Failures</a></li>
+<li><a href="#perf">Performance model on a LAN</a></li>
+<li><a href="#compromises">Compromises (read this one)</a></li>
+<li><a href="#alts">Alternatives considered</a></li>
+<li><a href="#prior">Prior art</a></li>
+<li><a href="#roadmap">Prototype roadmap and open questions</a></li>
+</ol>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="goals">1. Goals and assumptions</h2>
+
+<h3>Goals</h3>
+<ul>
+<li><strong>Run procedural code next to the data.</strong> Variables, <code>IF</code>, loops, cursors, exceptions and SQL statements inside one transaction.</li>
+<li><strong>Full ACID across shards.</strong> The target isolation level is <em>serializable</em>. Weaker levels are an optimisation, not the default.</li>
+<li><strong>Sharded and replicated storage.</strong> Losing one node per shard must lose no committed data and must not stop the cluster.</li>
+<li><strong>Minimal locking.</strong> No central lock manager, no deadlock detector, no lock table separate from the data.</li>
+<li><strong>Exploit parallelism inside one transaction.</strong> Independent statements of the code should run at the same time on different shards.</li>
+</ul>
+
+<h3>Design principles (used to settle every choice)</h3>
+<ol>
+<li><strong>Behave like a real transactional database.</strong> When in doubt, copy the semantics a PL/SQL developer already knows from Oracle, even if a newer idea looks nicer on paper.</li>
+<li><strong>Be fast on a small LAN cluster.</strong> The reference size is 1–5 shards and 2–4 replicas per shard.</li>
+<li><strong>Use only proven mechanisms.</strong> Every building block must already run in production in at least one known system. New ideas stay in "Alternatives" or "Open questions" until a prototype proves them.</li>
+</ol>
+
+<h3>Assumptions</h3>
+<ul>
+<li><strong>One LAN, one data centre.</strong> Round trip 20–100&nbsp;µs with kernel TCP, 3–10&nbsp;µs with RDMA. Not designed for WAN.</li>
+<li><strong>Bounded clock skew.</strong> NTP gives about 0.1–1&nbsp;ms on a LAN, PTP gives under 10&nbsp;µs. We need a bound, not perfect clocks.</li>
+<li><strong>Crash-stop failures.</strong> Nodes crash and restart; they do not lie (no Byzantine faults).</li>
+<li><strong>OLTP workload.</strong> Short to medium transactions that touch tens to thousands of rows. Large analytic scans are out of scope.</li>
+<li><strong>Durable local storage.</strong> NVMe with fsync of 20–100&nbsp;µs, or battery-backed memory.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="arch">2. Architecture</h2>
+
+<figure>
+<svg viewBox="0 0 820 430" role="img" aria-label="Architecture: client, gateway with compiler and coordinator, three shard Raft groups, clock service">
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+</defs>
+<!-- client -->
+<rect x="20" y="30" width="150" height="56" rx="8" class="node"/>
+<text x="95" y="55" text-anchor="middle" font-size="14" font-weight="600">Client</text>
+<text x="95" y="74" text-anchor="middle" font-size="12" class="muted">CALL transfer(…)</text>
+<!-- gateway -->
+<rect x="230" y="14" width="380" height="150" rx="10" class="acc"/>
+<text x="420" y="36" text-anchor="middle" font-size="14" font-weight="600">Gateway node (any node can be one)</text>
+<rect x="246" y="50" width="110" height="98" rx="6" class="node"/>
+<text x="301" y="76" text-anchor="middle" font-size="13" font-weight="600">Compiler</text>
+<text x="301" y="96" text-anchor="middle" font-size="11" class="muted">code → MI DAG</text>
+<text x="301" y="112" text-anchor="middle" font-size="11" class="muted">plan cache</text>
+<rect x="366" y="50" width="110" height="98" rx="6" class="node"/>
+<text x="421" y="76" text-anchor="middle" font-size="13" font-weight="600">Coordinator</text>
+<text x="421" y="96" text-anchor="middle" font-size="11" class="muted">owns txn record</text>
+<text x="421" y="112" text-anchor="middle" font-size="11" class="muted">priority, 2PC</text>
+<rect x="486" y="50" width="110" height="98" rx="6" class="node"/>
+<text x="541" y="76" text-anchor="middle" font-size="13" font-weight="600">Dispatcher</text>
+<text x="541" y="96" text-anchor="middle" font-size="11" class="muted">routes MIs</text>
+<text x="541" y="112" text-anchor="middle" font-size="11" class="muted">by shard map</text>
+<!-- clock -->
+<rect x="650" y="30" width="150" height="56" rx="8" class="node"/>
+<text x="725" y="55" text-anchor="middle" font-size="13" font-weight="600">HLC on each node</text>
+<text x="725" y="74" text-anchor="middle" font-size="11" class="muted">priority = (time, node)</text>
+<line x1="170" y1="58" x2="228" y2="58" class="line" marker-end="url(#ar)"/>
+<line x1="648" y1="58" x2="612" y2="58" class="dash"/>
+<!-- shards -->
+<g>
+<rect x="20" y="230" width="250" height="180" rx="10" class="okk"/>
+<text x="145" y="252" text-anchor="middle" font-size="14" font-weight="600">Shard A · Raft group</text>
+<rect x="36" y="266" width="218" height="58" rx="6" class="node"/>
+<text x="145" y="288" text-anchor="middle" font-size="12" font-weight="600">Leader replica</text>
+<text x="145" y="306" text-anchor="middle" font-size="11" class="muted">MI scheduler · MVCC store · intents</text>
+<rect x="36" y="334" width="104" height="60" rx="6" class="node"/>
+<text x="88" y="360" text-anchor="middle" font-size="12">Follower</text>
+<text x="88" y="378" text-anchor="middle" font-size="11" class="muted">log replica</text>
+<rect x="150" y="334" width="104" height="60" rx="6" class="node"/>
+<text x="202" y="360" text-anchor="middle" font-size="12">Follower</text>
+<text x="202" y="378" text-anchor="middle" font-size="11" class="muted">log replica</text>
+</g>
+<g>
+<rect x="285" y="230" width="250" height="180" rx="10" class="okk"/>
+<text x="410" y="252" text-anchor="middle" font-size="14" font-weight="600">Shard B · Raft group</text>
+<rect x="301" y="266" width="218" height="58" rx="6" class="node"/>
+<text x="410" y="288" text-anchor="middle" font-size="12" font-weight="600">Leader replica</text>
+<text x="410" y="306" text-anchor="middle" font-size="11" class="muted">MI scheduler · MVCC store · intents</text>
+<rect x="301" y="334" width="104" height="60" rx="6" class="node"/>
+<text x="353" y="368" text-anchor="middle" font-size="12">Follower</text>
+<rect x="415" y="334" width="104" height="60" rx="6" class="node"/>
+<text x="467" y="368" text-anchor="middle" font-size="12">Follower</text>
+</g>
+<g>
+<rect x="550" y="230" width="250" height="180" rx="10" class="okk"/>
+<text x="675" y="252" text-anchor="middle" font-size="14" font-weight="600">Shard C · Raft group</text>
+<rect x="566" y="266" width="218" height="58" rx="6" class="node"/>
+<text x="675" y="288" text-anchor="middle" font-size="12" font-weight="600">Leader replica</text>
+<text x="675" y="306" text-anchor="middle" font-size="11" class="muted">MI scheduler · MVCC store · intents</text>
+<rect x="566" y="334" width="104" height="60" rx="6" class="node"/>
+<text x="618" y="368" text-anchor="middle" font-size="12">Follower</text>
+<rect x="680" y="334" width="104" height="60" rx="6" class="node"/>
+<text x="732" y="368" text-anchor="middle" font-size="12">Follower</text>
+</g>
+<line x1="520" y1="164" x2="160" y2="228" class="line" marker-end="url(#ar)"/>
+<line x1="541" y1="164" x2="410" y2="228" class="line" marker-end="url(#ar)"/>
+<line x1="560" y1="164" x2="675" y2="228" class="line" marker-end="url(#ar)"/>
+<text x="610" y="200" font-size="11" class="muted">MIs + results</text>
+</svg>
+<figcaption>Figure 1. Every node runs all roles. A shard is a key range replicated by one Raft group; replicas of different shards are spread over the nodes, so each node leads some shards and follows others.</figcaption>
+</figure>
+
+<h3>Components</h3>
+<ul>
+<li><strong>Compiler.</strong> Parses the code, binds it to the schema, and produces an MI graph. Plans are cached per procedure and schema version, like Oracle caches compiled PL/SQL.</li>
+<li><strong>Coordinator.</strong> Owns the <em>transaction record</em>: id, priority, status (<code>RUNNING</code>, <code>PREPARED</code>, <code>COMMITTED</code>, <code>ABORTED</code>), and the list of shards touched. The record itself is stored in a shard, so it is replicated and survives the coordinator's crash.</li>
+<li><strong>Dispatcher.</strong> Looks up which shard owns each key (a cached range map) and sends MIs to that shard's leader. It batches MIs going to the same node.</li>
+<li><strong>Shard leader.</strong> Runs an <em>MI scheduler</em> (one per CPU core, see §4), holds the MVCC data and the write intents, and replicates its log to followers.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="compile">3. From the code to micro-instructions</h2>
+
+<h3>3.1 Running example</h3>
+<pre><code>PROCEDURE transfer(p_from NUMBER, p_to NUMBER, p_amt NUMBER) IS
+  v_bal NUMBER;
+BEGIN
+  SELECT balance INTO v_bal FROM account WHERE id = p_from;
+  IF v_bal &lt; p_amt THEN
+    RAISE_APPLICATION_ERROR(-20001, 'insufficient funds');
+  END IF;
+  UPDATE account SET balance = balance - p_amt WHERE id = p_from;
+  UPDATE account SET balance = balance + p_amt WHERE id = p_to;
+  INSERT INTO ledger(id, src, dst, amt) VALUES (ledger_seq.NEXTVAL, p_from, p_to, p_amt);
+END;</code></pre>
+
+<h3>3.2 Compilation pipeline</h3>
+<ol>
+<li><strong>Parse and bind.</strong> PL/SQL grammar → AST, resolve tables, columns, indexes.</li>
+<li><strong>Lower SQL statements to access paths.</strong> Each statement becomes point reads, range scans, index lookups or writes. <code>WHERE id = p_from</code> on a primary key becomes a single-key access.</li>
+<li><strong>Build an SSA dataflow graph.</strong> Every variable assignment gets a new name. Each MI depends only on the values it really uses, not on the textual order of the code. This is the step that exposes parallelism.</li>
+<li><strong>Partition by shard.</strong> Each MI is tagged with the key (or key range) it touches. The shard is computed at dispatch time, because parameters are known only then.</li>
+<li><strong>Keep program order where data may overlap.</strong> Two statements that touch the same table are kept in program order unless their keys are <em>proven</em> different. Keys are often parameters, so the check is done at dispatch time on the real values, like a CPU's memory disambiguation (see the box in 3.4).</li>
+<li><strong>Fuse.</strong> Consecutive MIs on the same key and shard with nothing remote in between are merged into one <em>MI block</em>, executed in one message. This is the database version of a CPU's macro-op fusion, and the same thing as CockroachDB's per-range request batching. Without it, fine-grained MIs drown in network messages.</li>
+</ol>
+
+<h3>3.3 The MI instruction set (first draft)</h3>
+<div class="tablewrap"><table>
+<thead><tr><th>MI</th><th>Runs at</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>GET k → r</code></td><td>owner of k</td><td>Read one version of key <code>k</code> at the transaction's read timestamp.</td></tr>
+<tr><td><code>GET_X k → r</code></td><td>owner of k</td><td>Read and place a write intent (read-for-update). Used when the code later updates the row.</td></tr>
+<tr><td><code>SCAN [a,b) pred → stream</code></td><td>owner(s) of range</td><td>Range read with a pushed-down filter. Records the range in the shard's read-timestamp table for phantom protection.</td></tr>
+<tr><td><code>PUT k v</code></td><td>owner of k</td><td>Write a provisional version (intent).</td></tr>
+<tr><td><code>APPLY k f(args)</code></td><td>owner of k</td><td>Read-modify-write executed at the data, e.g. <code>balance += p_amt</code>. Saves a round trip.</td></tr>
+<tr><td><code>DEL k</code></td><td>owner of k</td><td>Write a tombstone intent.</td></tr>
+<tr><td><code>CALC</code>, <code>GUARD c else e</code></td><td>wherever inputs are</td><td>Pure computation; <code>GUARD</code> raises exception <code>e</code> when <code>c</code> is false.</td></tr>
+<tr><td><code>LOOP / CURSOR_NEXT</code></td><td>coordinator</td><td>Control flow that depends on data. Unrolled dynamically (§4.3).</td></tr>
+<tr><td><code>SEQ_NEXT s → n</code></td><td>sequence owner</td><td>Non-transactional, gaps allowed, cached in blocks — same as Oracle sequences.</td></tr>
+<tr><td><code>PREPARE</code>, <code>COMMIT</code>, <code>ABORT</code></td><td>participants</td><td>Commit protocol (§6).</td></tr>
+</tbody>
+</table></div>
+
+<h3>3.4 The example as an MI graph</h3>
+<pre><code>T#  prio = (hlc=1730716800.000123, node=4)   read_ts = prio.time
+m1  GET_X   account[p_from]            → r1          @shard(p_from)
+m2  GUARD   r1.balance >= p_amt else -20001          deps: m1   (fused with m1)
+m3  PUT     account[p_from].balance = r1.balance - p_amt
+                                                     deps: m2   (fused with m1)
+m4  APPLY   account[p_to].balance += p_amt           deps: m3 only if p_to = p_from (checked at dispatch)
+                                                     control dep on m2: speculative (experiment, see below)
+m5  SEQ_NEXT ledger_seq                → n           deps: —
+m6  PUT     ledger[n] = (p_from, p_to, p_amt)        deps: m5
+m7  COMMIT                                           deps: m3, m4, m6, and m2 = true</code></pre>
+
+<figure>
+<svg viewBox="0 0 820 260" role="img" aria-label="Dependency graph: m1 m2 m3 fused on shard A; m4 on shard B; m5 m6 on shard C; all feed commit m7">
+<defs>
+<marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+</defs>
+<text x="20" y="26" font-size="12" class="muted">t = 0: all three blocks are issued at once</text>
+<rect x="20" y="40" width="330" height="56" rx="8" class="acc"/>
+<text x="185" y="64" text-anchor="middle" font-size="13" font-weight="600">Block 1 @ shard A: m1 → m2 → m3</text>
+<text x="185" y="83" text-anchor="middle" font-size="11" class="muted">read-for-update, check, write — one message</text>
+<rect x="20" y="112" width="330" height="56" rx="8" class="wrn"/>
+<text x="185" y="136" text-anchor="middle" font-size="13" font-weight="600">Block 2 @ shard B: m4 (speculative, experiment)</text>
+<text x="185" y="155" text-anchor="middle" font-size="11" class="muted">intent is undone if m2 fails</text>
+<rect x="20" y="184" width="330" height="56" rx="8" class="node"/>
+<text x="185" y="208" text-anchor="middle" font-size="13" font-weight="600">Block 3 @ shard C: m5 → m6</text>
+<text x="185" y="227" text-anchor="middle" font-size="11" class="muted">sequence + insert ledger row</text>
+<rect x="520" y="100" width="280" height="76" rx="8" class="okk"/>
+<text x="660" y="130" text-anchor="middle" font-size="13" font-weight="600">m7 COMMIT (coordinator)</text>
+<text x="660" y="150" text-anchor="middle" font-size="11" class="muted">waits for 3 acks, then prepare/commit</text>
+<path d="M350,68 C440,68 440,120 518,128" class="line" marker-end="url(#ar2)"/>
+<path d="M350,140 L518,140" class="line" marker-end="url(#ar2)"/>
+<path d="M350,212 C440,212 440,160 518,152" class="line" marker-end="url(#ar2)"/>
+</svg>
+<figcaption>Figure 2. Textually the code is five sequential statements. With full dataflow analysis and speculation it is three parallel network messages plus the commit. The proven v1 baseline (box below) needs one more round trip.</figcaption>
+</figure>
+
+<div class="box warn">
+<p><strong>Same-key check (a bug the first draft had).</strong> If a caller runs <code>transfer(7, 7, 100)</code>, <code>m3</code> and <code>m4</code> touch the same row. Run out of order, <code>m3</code> would overwrite the credit made by <code>m4</code>, and the balance would end 100 lower instead of unchanged. The compiler cannot know <code>p_from ≠ p_to</code>, so it adds a <em>conditional</em> dependency. The dispatcher compares the real keys and keeps program order when they are equal (for ranges: when they overlap). Any statement whose keys cannot be compared this way runs in program order.</p>
+</div>
+
+<div class="box">
+<p><strong>Speculation, explained — an experiment, off in v1.</strong> In the code, the credit to <code>p_to</code> comes after the <code>IF</code>. The compiler sees that <code>m4</code> does not use any value from <code>m1</code>; only the <em>control</em> depends on it. So it could issue <code>m4</code> early, like a CPU predicting a branch. If <code>m2</code> raises the exception, the transaction aborts and the intent left by <code>m4</code> is discarded; nothing was ever visible. The cost of a wrong guess is a wasted intent, which may have blocked or wounded another transaction for nothing.</p>
+<p>No production database does this. So <strong>v1 uses only write pipelining</strong>, proven in CockroachDB since 2018: the code runs in program order, the <code>IF</code> waits for the read, and the writes after it are then all sent at once without waiting for each other. That costs one extra round trip (§9). Speculation stays an experiment, measured against this baseline.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="exec">4. Execution: the database as a CPU</h2>
+
+<p>Your intuition maps well onto how a modern out-of-order CPU works. The table makes the analogy explicit. It is a useful design guide, but §10 lists where it breaks.</p>
+
+<div class="tablewrap"><table>
+<thead><tr><th>CPU concept</th><th>Equivalent here</th></tr></thead>
+<tbody>
+<tr><td>Instruction stream</td><td>The code (PL/SQL procedure)</td></tr>
+<tr><td>Decode into micro-ops</td><td>Compile into MIs</td></tr>
+<tr><td>Register renaming</td><td>SSA form of PL/SQL variables</td></tr>
+<tr><td>Issue queue / reservation station</td><td>Per-core MI run queue on each shard leader, ordered by priority</td></tr>
+<tr><td>Load/store queue, memory disambiguation</td><td>Write intents and read timestamps on each record</td></tr>
+<tr><td>Reorder buffer, in-order retire</td><td>Transaction record; commit makes all intents visible at once</td></tr>
+<tr><td>Branch prediction and squash</td><td>Speculative MIs; on abort, intents are discarded (experiment, off in v1)</td></tr>
+<tr><td>Cache coherence (MESI)</td><td>Single owner (leader) per shard — no coherence protocol needed</td></tr>
+<tr><td>Hardware thread priority / arbitration</td><td>Transaction priority decides who wins a record</td></tr>
+</tbody>
+</table></div>
+
+<h3>4.1 The per-core scheduler</h3>
+<p>Each node runs one thread per CPU core, and each shard is owned by exactly one core (thread-per-core, as in ScyllaDB). Redpanda proves this model works with one Raft group per partition, which is our setup. With 1–5 shards and a few cores per node, a "shard" in this document can be split into one Raft group per core. That removes all in-memory latches: two MIs on the same key are always on the same core, and that core runs one MI at a time. "Concurrency" inside a core is interleaving, never parallel access.</p>
+<p>Each core loops forever:</p>
+<pre><code>loop:
+  pull arrived MIs from the network ring into the ready queue
+  pick the ready MI with the highest priority       # oldest transaction first
+  run it to completion or until it hits a conflict  # microseconds, never blocks the core
+  on conflict: apply the priority rule (§5) — park, or wound the other txn
+  send results / acks (batched)
+  every few µs: append the accumulated writes to the Raft log (group commit)</code></pre>
+<p>MIs never block a thread. A waiting MI is a parked data structure on the record's wait list, costing a few dozen bytes. This is what makes "MIs continuously executing" cheap: the CPU spends its time on ready work, highest priority first.</p>
+
+<h3>4.2 Where the code's state lives</h3>
+<p>Variables of the code live in the <em>coordinator's frame</em>. MIs carry the values they need as arguments and return results to the coordinator, which resolves dependencies and fires the next MIs. For a fused block running entirely on one shard, intermediate values stay on that shard. Moving the whole frame to the shard that does most of the work would save more round trips, but no SQL engine I know of does this for general procedures, so it is an open question (§13), not part of the design.</p>
+
+<h3>4.3 Loops and cursors</h3>
+<p>A loop whose trip count depends on data cannot be fully expanded at compile time. Strategies, from proven to experimental:</p>
+<ul>
+<li><strong>Bulk fetch</strong> <span class="tag lo">proven</span> A cursor <code>FOR</code> loop fetches rows 100 at a time instead of one by one, as Oracle has done automatically since 10g.</li>
+<li><strong>Pipelined writes</strong> <span class="tag lo">proven</span> The writes inside the loop are sent without waiting for each other, batched per shard (CockroachDB pipelining and batching). The commit waits for them all.</li>
+<li><strong>Set-oriented rewrite</strong> <span class="tag md">experiment</span> <code>FOR r IN (SELECT …) LOOP UPDATE … WHERE id = r.id; END LOOP</code> becomes one <code>SCAN</code> plus one <code>APPLY</code> per shard, sent in parallel. SQL Server inlines scalar functions into queries (Froid, in production since 2019), but rewriting whole loops is still research (Aggify, DBridge). v1 does not do it.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="prio">5. Concurrency control by priority</h2>
+
+<p>This is the heart of your idea. The goal is to replace a lock manager with a rule that any shard can apply alone, using only local information plus the priority carried by each MI.</p>
+
+<h3>5.1 What a priority is</h3>
+<ul>
+<li>When a transaction starts, the coordinator takes a <strong>hybrid logical clock</strong> value (physical time + logical counter) and appends its node id: <code>prio = (hlc, node_id)</code>. This is unique and totally ordered across the cluster, with no central service.</li>
+<li><strong>Lower value = older = higher priority.</strong></li>
+<li>The priority is <strong>fixed for the life of the transaction, including restarts.</strong> A transaction that was wounded restarts with its old priority, so it gets older relative to newcomers and eventually wins. This prevents starvation.</li>
+<li>The same value is the transaction's MVCC <em>read timestamp</em> at first. It may be pushed forward (§5.4) but the priority is not.</li>
+</ul>
+
+<h3>5.2 What each record holds</h3>
+<pre><code>record k:
+  versions:    [(commit_ts, value), …]     # committed MVCC history, newest first
+  intent:      none | (txn_id, prio, provisional_value)   # at most ONE writer
+  max_read_ts: timestamp                   # highest ts that has read k
+  waiters:     list of parked MIs, sorted by prio</code></pre>
+<p>The intent <em>is</em> the only "lock" in the system. It lives inside the record, costs no extra lookup, and is replicated with the data. There is no separate lock table.</p>
+
+<h3>5.3 The rules (wound-wait)</h3>
+<p>When an MI of transaction <strong>T</strong> arrives at record <strong>k</strong>, which carries an intent from transaction <strong>H</strong> (the holder):</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Situation</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><td>No intent, T reads</td><td>Read the newest version with <code>commit_ts ≤ T.read_ts</code>. Raise <code>max_read_ts</code>. Never waits.</td></tr>
+<tr><td>No intent, T writes</td><td>If <code>max_read_ts &gt; T.ts</code>, a younger reader already saw the old value: push T's commit timestamp above it (§5.4). Then place the intent.</td></tr>
+<tr><td>Intent from H, T is <strong>older</strong> than H</td><td><strong>Wound H.</strong> Mark H's transaction record <code>ABORTED</code> (if it is still <code>RUNNING</code>), remove its intent, proceed. H restarts later with its old priority.</td></tr>
+<tr><td>Intent from H, T is <strong>younger</strong> than H</td><td><strong>Wait.</strong> Park T's MI on <code>waiters</code>. It wakes when H commits or aborts.</td></tr>
+<tr><td>Intent from H, H is already <code>PREPARED</code></td><td>Wait, whatever the priorities. A prepared transaction can no longer be wounded (it may already be committed elsewhere). Prepare is short, so the wait is short.</td></tr>
+<tr><td>T only reads, H's intent has a timestamp above T's read_ts</td><td>Ignore the intent and read the older version. MVCC means most reads are never blocked.</td></tr>
+</tbody>
+</table></div>
+
+<div class="box ok">
+<p><strong>Why no deadlock is possible.</strong> A transaction only ever waits for an <em>older</em> one. So every "waits-for" arrow points from younger to older. Arrows that always point in the same direction of a total order cannot form a cycle. No shard needs to know anything about other shards' waits — the rule is local and the result is global. This is exactly what you were after: the priority replaces deadlock detection.</p>
+</div>
+
+<div class="box">
+<p><strong>Why it is serializable.</strong> Write–write conflicts are ordered by intents (one writer per record, like strict two-phase locking for writes). Read–write conflicts are ordered by timestamps (MVCC plus <code>max_read_ts</code>, like timestamp ordering). Commit timestamps are chosen so that every transaction's reads and writes are consistent at one point in time. This is the same family of protocol as CockroachDB's serializable mode; the priority layer only decides <em>who waits</em>.</p>
+</div>
+
+<h3>5.4 Timestamp pushes and read refresh</h3>
+<p>When T's commit timestamp must move forward (a younger reader saw a key T wants to write), T's earlier reads may no longer be valid at the new timestamp. Before commit T runs a cheap <em>refresh</em>: it asks each shard "has any key I read changed between my old and new timestamp?". If not, T commits at the new timestamp with no restart. If yes, T restarts (keeping its priority). The coordinator keeps the read set for this, as key ranges, not values.</p>
+
+<h3>5.5 Priority classes</h3>
+<p>Pure age has one drawback: a long batch job becomes very old and wounds every short interactive transaction it meets. The fix is to put a <em>class</em> in the most significant bits:</p>
+<pre><code>prio = (class, hlc, node_id)      # class 0 = system, 1 = interactive, 2 = batch</code></pre>
+<p>The order is still total and fixed per transaction, so the deadlock-freedom argument still holds. User-chosen classes are proven: CockroachDB has <code>LOW</code>/<code>NORMAL</code>/<code>HIGH</code> transaction priorities that decide who wins a conflict. The class never changes automatically. A batch job can therefore be delayed by a constant stream of interactive work. The proven answer is to keep batch blocks small (§7.4), so each one has a short window to be wounded in. Automatic promotion after N restarts is an open question (§13).</p>
+
+<h3>5.6 Priority inversion</h3>
+<p>A high-priority transaction can wait on a <code>PREPARED</code> low-priority one. This wait is bounded: a prepared transaction only needs one more consensus round (about 80&nbsp;µs) to finish. v1 therefore does nothing special. Priority inheritance ("boosting" the holder) is proven in real-time operating systems, not in distributed databases, so it is listed as an open question.</p>
+
+<!-- ============================================================ -->
+<h2 id="storage">6. Sharding, replication and commit</h2>
+
+<h3>6.1 Sharding</h3>
+<ul>
+<li><strong>Range sharding</strong> on the primary key, automatic split at ~256&nbsp;MB or on load, automatic merge. Range sharding keeps scans local; hash sharding would spread hot sequential inserts but kill range scans.</li>
+<li><strong>Co-location by key design.</strong> Child tables start their primary key with the parent's key, e.g. <code>order_line</code> keyed by <code>(customer_id, order_id, line)</code>. With range sharding, a customer's rows then usually sit on one shard, and most procedures touch a single shard — the cheapest case by far. A stronger feature, "interleaved tables", forces parent and child rows into the same range. Spanner has it, but CockroachDB removed it in 2021 because it cost more than it saved. v1 relies on key design only.</li>
+<li><strong>Secondary indexes</strong> are separate ranges, so an index update is a second MI, often on another shard. That is a real cost (§10).</li>
+</ul>
+
+<h3>6.2 Replication</h3>
+<p>One <strong>Raft group per shard</strong>, 3 replicas by default (see the table below for the 2–4 range). The leader holds a time-based <em>lease</em>, so it can serve reads without a Raft round. Intents and the transaction record are written to the Raft log like data, so a new leader knows every intent after a failover.</p>
+<p>Writes are applied to the leader's memory immediately (so later MIs of the same transaction see them), but the transaction cannot commit until the intents are durable on a majority.</p>
+
+<h4>How many replicas, for the 2–4 range</h4>
+<p>A majority-based protocol counts <em>votes</em>, so the number of replicas does not translate directly into safety:</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Replicas</th><th>Commit waits for</th><th>Failures tolerated</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>2</td><td>both</td><td>0 — one failure stops writes</td><td>Avoid. Twice the storage, no availability gain.</td></tr>
+<tr><td>2 + 1 witness</td><td>2 of 3 votes</td><td>1</td><td>Good when storage is expensive. The witness keeps only the log, not the data. While one data replica is down, only one full copy of the data exists until repair. Proven: Spanner witness replicas; same idea as a cluster quorum witness.</td></tr>
+<tr><td><strong>3</strong></td><td>2 of 3</td><td>1</td><td><strong>Default.</strong> Commit waits for the faster of the two followers.</td></tr>
+<tr><td>4 (all voting)</td><td>3 of 4</td><td>1</td><td>Avoid: same failure tolerance as 3, slower commit.</td></tr>
+<tr><td>3 voting + 1 learner</td><td>2 of 3</td><td>1</td><td>Use when a 4th copy is wanted for reads or backup. The learner gets the log but does not vote. Proven: Raft learners (etcd, TiKV), CockroachDB non-voting replicas.</td></tr>
+</tbody>
+</table></div>
+
+<h3>6.3 Commit</h3>
+<ul>
+<li><strong>One shard:</strong> a single Raft write turns intents into committed versions. One fsync, one LAN round trip to followers.</li>
+<li><strong>Several shards:</strong> two-phase commit where the coordinator's transaction record is itself a Raft-replicated key. Because participants and coordinator are all replicated, 2PC does not have its classic blocking problem.</li>
+<li><strong>Parallel commit optimisation</strong> (from CockroachDB): write intents and the <code>STAGING</code> transaction record in parallel; the transaction is committed as soon as all are durable. The client gets the answer after one consensus round instead of two. Intents are cleaned up asynchronously.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="blocks">7. Transaction blocks inside a routine</h2>
+
+<p>A routine is often more than one transaction. A batch procedure, for example, commits every few thousand rows. The code is then a sequence of <strong>blocks</strong> separated by <code>COMMIT</code> or <code>ROLLBACK</code>:</p>
+<pre><code>BEGIN
+  … block B1 …   COMMIT;
+  … block B2 …   COMMIT;
+  … block B3 …   -- ends with the call: implicit COMMIT, or ROLLBACK on error
+END;</code></pre>
+<p>This section states exactly what is protected. Each choice follows the three design principles of §1: Oracle semantics, cheap on a small LAN cluster, already proven elsewhere.</p>
+
+<h3>7.1 What one block guarantees</h3>
+<p>Each block is one complete transaction, with the full guarantees of §5 and §6:</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Property</th><th>How</th><th>Proven in</th></tr></thead>
+<tbody>
+<tr><td><strong>Atomic</strong>, across shards too</td><td>Writes are invisible intents until one replicated write sets the transaction record to <code>COMMITTED</code>. All writes appear at that instant, or none do.</td><td>CockroachDB, Percolator/TiDB</td></tr>
+<tr><td><strong>Consistent</strong></td><td>Keys, foreign keys and check constraints run as MIs inside the block, before commit.</td><td>All SQL databases</td></tr>
+<tr><td><strong>Isolated</strong> (serializable)</td><td>MVCC reads at one timestamp, one writer per record, wound-wait between writers.</td><td>Spanner, CockroachDB</td></tr>
+<tr><td><strong>Durable</strong></td><td>Commit is acknowledged only once a majority of replicas has it on disk.</td><td>Raft/Paxos systems</td></tr>
+</tbody>
+</table></div>
+<div class="box warn">
+<p><strong>What is not protected</strong> — exactly as in Oracle: <em>between</em> two blocks, other transactions can read and change the data. B2 does not see the database "as B1 left it", only as it is when B2 starts. Isolation holds per block, not per routine.</p>
+</div>
+
+<h3>7.2 Choices</h3>
+<div class="tablewrap"><table>
+<thead><tr><th>Question</th><th>Choice</th><th>Why</th><th>Proven in</th></tr></thead>
+<tbody>
+<tr><td>Is a new block a new transaction?</td><td>Yes. New transaction id, new priority and timestamp taken at the block's first MI.</td><td>Same as Oracle and PostgreSQL. Carrying the routine's priority into later blocks was considered and rejected: it is not done in any system I know of.</td><td>Every SQL database</td></tr>
+<tr><td>A block is wounded by an older transaction</td><td>The coordinator re-runs only that block, from its first statement, with the variable values as they were at the last <code>COMMIT</code>. The block keeps its original priority, so it cannot starve. Earlier blocks are untouched.</td><td>The client never sees the conflict. Output is buffered (e.g. <code>DBMS_OUTPUT</code>) and thrown away on retry.</td><td>Spanner and FoundationDB retry loops; CockroachDB automatic retries</td></tr>
+<tr><td>A SQL statement fails inside a block</td><td>Only that statement is rolled back (implicit savepoint before each statement). The exception goes to the PL/SQL handler, which can continue.</td><td>Exact Oracle behaviour (statement-level atomicity).</td><td>Oracle; savepoints over intents in CockroachDB</td></tr>
+<tr><td>An exception leaves the routine unhandled</td><td>The current block's uncommitted work is rolled back. Committed blocks stay. The error goes to the client.</td><td>Exact Oracle behaviour.</td><td>Oracle</td></tr>
+<tr><td>A cursor stays open across <code>COMMIT</code></td><td>Allowed. The cursor keeps reading at its original timestamp (old MVCC versions). If those versions were garbage-collected, the fetch fails with "snapshot too old". The MVCC history is kept for a configurable time, 1&nbsp;hour by default.</td><td>Matches Oracle's read consistency and its ORA-01555 error. It replaces the earlier restriction in §10.3.</td><td>Oracle undo; CockroachDB GC TTL and historical reads</td></tr>
+<tr><td>A <code>FOR UPDATE</code> cursor stays open across <code>COMMIT</code></td><td>The cursor is closed by the commit; the next fetch fails ("fetch out of sequence"). Its intents were released by the commit.</td><td>Exact Oracle behaviour (ORA-01002).</td><td>Oracle</td></tr>
+<tr><td>The coordinator crashes between blocks</td><td>The routine stops. Committed blocks stay, the open block is rolled back, and the client gets a connection error. <strong>No automatic resume.</strong></td><td>See 7.3.</td><td>Oracle, PostgreSQL</td></tr>
+<tr><td>A later block fails for a business reason</td><td>Earlier blocks are not undone. Undoing them is application code (compensation).</td><td>No real database undoes committed work automatically.</td><td>Sagas (Garcia-Molina &amp; Salem, 1987)</td></tr>
+</tbody>
+</table></div>
+
+<h3>7.3 Why the routine does not resume automatically after a crash</h3>
+<p>One could save the routine's variables and position inside each <code>COMMIT</code>, and let another node continue after a crash ("durable execution"). I considered it and <strong>left it out of the main design</strong>:</p>
+<ul>
+<li>It is proven in workflow engines (Temporal, Azure Durable Functions), not inside a SQL engine running PL/SQL. That fails principle 3.</li>
+<li>It changes semantics a developer relies on. In Oracle a dead session means a stopped routine, and the developer's restart logic assumes that. That fails principle 1.</li>
+<li>Saving the state is cheap, but restoring it is not simple: open cursors, package state, temporary tables and session settings would all need saving too.</li>
+</ul>
+<p>Instead the design supports the pattern every batch framework already uses: a <strong>progress table written in the same block as the work</strong>. Because both are in one transaction, the progress row is correct after any crash. Rerunning the routine continues where the last committed block ended. This is proven in Spring Batch's job repository and Oracle's <code>DBMS_PARALLEL_EXECUTE</code> chunk status.</p>
+<pre><code>PROCEDURE monthly_interest(p_month DATE) IS
+  v_last NUMBER;
+  v_n    PLS_INTEGER;
+BEGIN
+  SELECT last_id INTO v_last FROM job_progress
+   WHERE job = 'monthly_interest' AND period = p_month;
+  LOOP
+    v_n := 0;
+    FOR r IN (SELECT id FROM account WHERE id &gt; v_last
+              ORDER BY id FETCH FIRST 1000 ROWS ONLY) LOOP
+      UPDATE account SET balance = balance * 1.01 WHERE id = r.id;
+      v_last := r.id;
+      v_n    := v_n + 1;
+    END LOOP;
+    EXIT WHEN v_n = 0;
+    UPDATE job_progress SET last_id = v_last          -- same block as the work
+     WHERE job = 'monthly_interest' AND period = p_month;
+    COMMIT;                                            -- one block = 1000 accounts
+  END LOOP;
+END;</code></pre>
+<p>The same table also settles the one case no database can avoid: when the connection drops <em>during</em> a <code>COMMIT</code>, the client cannot know whether that block committed. Reading <code>job_progress</code> answers it.</p>
+
+<h3>7.4 Cost of a block on a small cluster</h3>
+<p>For 1–5 shards with 3 replicas (or 2 + witness), on the network assumptions of §1:</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Block touches</th><th>Commit cost</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>1 shard</td><td class="n">≈ 80 µs</td><td>One consensus round: 1 RTT to the fastest follower + 1 fsync.</td></tr>
+<tr><td>2–5 shards</td><td class="n">≈ 80–100 µs</td><td>Parallel commit: all shards replicate at the same time. With at most 5 shards the fan-out is at most 5 messages. Intent cleanup happens after the client has its answer.</td></tr>
+</tbody>
+</table></div>
+<p>So a routine that commits after every row is limited to roughly 10,000 blocks per second — the same problem Oracle has with "log file sync" waits. The guidance is the same as in Oracle: <strong>100 to 10,000 rows per block</strong>. Smaller blocks pay the commit cost too often. Larger blocks hold intents longer, get wounded more often, and lose more work when they restart.</p>
+
+<!-- ============================================================ -->
+<h2 id="fail">8. Failures</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>Failure</th><th>Effect</th><th>Recovery</th></tr></thead>
+<tbody>
+<tr><td>Shard leader crashes</td><td>MIs in flight to it are lost</td><td>Raft elects a new leader after the lease expires: typically 1 to 10&nbsp;s depending on timeouts (etcd's default election timeout is 1&nbsp;s). Writes to that shard pause meanwhile. The coordinator resends MIs; each MI has an id <code>(txn, seq)</code> so re-execution is idempotent.</td></tr>
+<tr><td>Coordinator crashes</td><td>Transaction state in its memory is lost</td><td>The transaction record is replicated. Any shard that finds a stale intent checks the record: <code>RUNNING</code> with expired heartbeat → abort; <code>STAGING</code> → finish the commit if all intents are durable.</td></tr>
+<tr><td>Network partition</td><td>Minority side loses quorum</td><td>Minority shards stop accepting writes (and leased reads after lease expiry). This is a deliberate CP choice.</td></tr>
+<tr><td>Clock jumps / skew over the bound</td><td>Possible stale reads</td><td>Nodes whose clock offset exceeds the configured max (e.g. 250&nbsp;ms) shut themselves down. Within the bound, reads use an uncertainty window and restart if they see a value in it.</td></tr>
+</tbody>
+</table></div>
+
+<!-- ============================================================ -->
+<h2 id="perf">9. Performance model on a LAN</h2>
+<p>Rough numbers for the <code>transfer</code> example with 3 replicas, kernel TCP (RTT ≈ 50&nbsp;µs), NVMe fsync ≈ 30&nbsp;µs. These are order-of-magnitude estimates to guide design, not measurements.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Step</th><th>Naive: one statement at a time, classic 2PC</th><th>v1, proven only: pipelined writes, batching, parallel commit</th><th>Experiment: parallel issue + speculation</th></tr></thead>
+<tbody>
+<tr><td>Statements → round trips</td><td class="n">5 × 50 = 250 µs</td><td class="n">2 × 50 = 100 µs<br>(read, then 3 writes at once)</td><td class="n">1 × 50 µs<br>(3 blocks at once)</td></tr>
+<tr><td>Commit</td><td class="n">2 × (50 + 30) = 160 µs</td><td class="n">50 + 30 = 80 µs</td><td class="n">50 + 30 = 80 µs</td></tr>
+<tr><td>CPU (cached plan, MIs)</td><td class="n">~20 µs</td><td class="n">~20 µs</td><td class="n">~20 µs</td></tr>
+<tr><td><strong>Latency, no contention</strong></td><td class="n"><strong>~430 µs</strong></td><td class="n"><strong>~200 µs</strong></td><td class="n"><strong>~150 µs</strong></td></tr>
+</tbody>
+</table></div>
+<p>The proven techniques alone give most of the gain (430 → 200&nbsp;µs). The experimental part of the MI idea adds 200 → 150&nbsp;µs on this example. It adds more on procedures with many independent reads, and nothing on procedures that are one long chain of dependent statements (§10.4).</p>
+<p>Throughput is bounded by the slower of: CPU per MI per core (target 1–3&nbsp;µs for a point access → ~300k–1M MIs/s/core), and network messages (batching is essential). Under high contention on a hot record, throughput is bounded by the commit latency of that one record, roughly 1 / 80&nbsp;µs ≈ 12k transactions/s on that key, whatever the cluster size. That is a property of serializability on a single row, not of this design.</p>
+
+<!-- ============================================================ -->
+<h2 id="compromises">10. Compromises</h2>
+<p>You asked me to say clearly where the design gives something up. Here they are, ordered by how much they move away from your original idea.</p>
+
+<h3>10.1 Priority alone is not enough — intents are still a minimal lock <span class="tag hi">core</span></h3>
+<p>The pure idea would be: "no locks, only priorities, like a CPU". It does not work by itself, for two reasons:</p>
+<ul>
+<li><strong>A CPU has one memory and one clock; we have many nodes.</strong> A CPU core can squash and replay instructions within nanoseconds because the whole state is in one chip. Here, the conflicting MIs may run on different machines microseconds apart. Someone must remember "T is writing this record" until T commits. That memory is the intent.</li>
+<li><strong>Without a marker, a younger writer cannot know it must wait.</strong> Priorities decide <em>who wins</em>; intents tell <em>that there is a contest</em>.</li>
+</ul>
+<p>So the compromise is: one intent per record, stored in the record, plus the wound-wait rule. No lock table, no lock modes, no lock escalation, no deadlock detector. Reads are lock-free thanks to MVCC. This is as close to "locking by priority" as I believe a correct distributed system can get.</p>
+
+<h3>10.2 Work is thrown away under contention <span class="tag hi">core</span></h3>
+<p>Wound-wait resolves conflicts by restarting the younger transaction. On a hot record, many young transactions may be wounded repeatedly. Each restart costs network round trips and CPU. Mitigations:</p>
+<ul>
+<li>Waiting is preferred over wounding when the holder is close to commit (it sent <code>PREPARE</code>).</li>
+<li>Applications with one very hot row (a global counter) need a schema change (split counter), as in every distributed database.</li>
+</ul>
+
+<h3>10.3 The code must be restartable <span class="tag hi">core</span></h3>
+<p>Because a transaction may be wounded and replayed at any time, everything before commit must be <strong>side-effect free outside the database</strong> and <strong>deterministic given the data it read</strong>. Consequences for PL/SQL compatibility:</p>
+<div class="tablewrap"><table>
+<thead><tr><th>PL/SQL feature</th><th>Status</th><th>Reason / replacement</th></tr></thead>
+<tbody>
+<tr><td>Variables, IF, loops, exceptions, records, collections</td><td>Supported</td><td>Pure, restartable.</td></tr>
+<tr><td><code>SELECT … FOR UPDATE</code>, cursors</td><td>Supported</td><td>Maps to <code>GET_X</code> / <code>SCAN</code> with intents.</td></tr>
+<tr><td><code>COMMIT</code>/<code>ROLLBACK</code> inside the procedure</td><td>Supported</td><td>Splits the code into blocks, each a full transaction; only the current block restarts. Cursors may stay open across a commit, with Oracle semantics. See §7.</td></tr>
+<tr><td><code>SAVEPOINT</code> / partial rollback</td><td>Supported</td><td>Intents carry a sequence number; rollback to savepoint drops later ones.</td></tr>
+<tr><td>Autonomous transactions</td><td>Restricted</td><td>Allowed only for logging, and they run as a separate transaction with its own priority. They do not roll back when the calling block restarts (§7.2), so they may log the same thing twice.</td></tr>
+<tr><td><code>UTL_HTTP</code>, <code>UTL_FILE</code>, sending mail, calling external services</td><td>Not supported inside a transaction</td><td>A restart would repeat the side effect. Use an "outbox" table written transactionally and a separate process that delivers.</td></tr>
+<tr><td><code>SYSDATE</code>, <code>DBMS_RANDOM</code></td><td>Changed semantics</td><td><code>SYSDATE</code> returns the transaction timestamp, stable across restarts (like PostgreSQL's <code>now()</code>). <code>DBMS_RANDOM</code> works normally: a restart may draw other values, which is safe because nothing has left the database yet.</td></tr>
+<tr><td><code>EXECUTE IMMEDIATE</code> (dynamic SQL)</td><td>Supported, slower</td><td>Compiled at run time; no cross-statement parallelism with code around it.</td></tr>
+<tr><td>Triggers</td><td>Supported</td><td>Inlined into the MI graph of the triggering statement.</td></tr>
+<tr><td>DDL inside procedures</td><td>Not supported</td><td>Schema changes go through an online schema-change protocol, outside user transactions.</td></tr>
+</tbody>
+</table></div>
+
+<h3>10.4 Parallelism inside the code is limited by data dependencies <span class="tag md">medium</span></h3>
+<p>Code like "read A, use the result to find B, use B to find C" is a chain; no compiler can make it parallel. Each link costs one LAN round trip. Speculation (an experiment anyway) helps only for control dependencies, not data dependencies. On top of the proven v1 baseline, expect parallel issue to add tens of percent on typical procedures, not multiples. Co-locating data usually matters more.</p>
+
+<h3>10.5 MI granularity: messages versus parallelism <span class="tag md">medium</span></h3>
+<p>Very small MIs give maximum scheduling freedom but one network message each, and a message costs 10–50× more than the MI's work. Very large blocks need few messages but hold intents longer and expose less parallelism. The design compromise: the compiler produces fine MIs, then fuses everything that targets the same shard with no remote dependency in between. Granularity is chosen by the compiler, not by the programmer.</p>
+
+<h3>10.6 Clocks: bounded skew is an assumption <span class="tag md">medium</span></h3>
+<p>Priorities and timestamps come from hybrid logical clocks. Correctness of <em>priority</em> does not depend on clocks (any unique total order works). But <em>external consistency</em> (a transaction that starts after another one commits sees its writes) needs a skew bound, enforced by self-shutdown of drifting nodes. On a single LAN with NTP or PTP this is a weak assumption. The alternative, a central timestamp oracle (as in TiDB), is also proven. It removes the clock-uncertainty restarts but adds one round trip per transaction (about 50&nbsp;µs here) and one more service to keep highly available. On a 1–5 shard cluster it is a realistic fallback if HLC uncertainty restarts turn out to be frequent.</p>
+
+<h3>10.7 Consistency over availability <span class="tag md">medium</span></h3>
+<p>Synchronous majority replication means: a shard that loses its majority stops serving writes. A shard with 3 replicas tolerates 1 failure; with 5, it tolerates 2. Every commit pays at least one LAN round trip and one fsync. I chose this because "transactional" in your request implies no lost commits. Asynchronous replication would cut latency by ~80&nbsp;µs per commit but loses recent commits on failover.</p>
+
+<h3>10.8 Cross-shard transactions cost more <span class="tag md">medium</span></h3>
+<p>A transaction on one shard commits in one consensus round. Across shards it needs the replicated transaction record, intent resolution on each shard, and is more exposed to wounds. Schema design (co-location by key prefix) matters more than in a single-node Oracle database. Secondary indexes make even simple updates multi-shard.</p>
+
+<h3>10.9 Phantoms need range tracking <span class="tag lo">minor</span></h3>
+<p>Serializable isolation must prevent a concurrent insert into a range another transaction scanned. Each shard keeps a compact interval structure of <code>(range, max_read_ts)</code>. It is approximate (ranges are merged when memory is tight), which can cause unnecessary timestamp pushes, but never incorrect results.</p>
+
+<h3>10.10 Not an analytics engine <span class="tag lo">minor</span></h3>
+<p>Large scans run as MIs too, but the store is row-oriented and the scheduler is tuned for short MIs. Long scans are split into chunks with low priority class so they do not starve OLTP. Real analytics should go to a column-store replica.</p>
+
+<!-- ============================================================ -->
+<h2 id="alts">11. Alternatives considered</h2>
+
+<h3>11.1 Deterministic ordering (Calvin-style): the "purest" priority</h3>
+<p>Take your idea to its extreme: give every transaction its priority <em>before</em> it runs, by putting all transactions into a replicated global log in batches of ~10&nbsp;ms. Every shard then executes transactions in log order. No locks at all, no aborts from conflicts, no 2PC (every replica deterministically reaches the same result).</p>
+<p><strong>Why it is not the main design:</strong> the system must know each transaction's read and write set before it runs. PL/SQL code decides what to touch based on what it reads. Calvin handles that with a "reconnaissance" pass and a restart if the guess was wrong, which is costly for exactly the kind of code you want to run. Also, every transaction pays the batching delay (milliseconds), even when there is no conflict.</p>
+<p><strong>Where it is a good fit:</strong> procedures whose keys are all known from parameters (like <code>transfer</code>). A later version could run such procedures in a deterministic fast path and the rest through wound-wait. Mixing the two safely is an open research question.</p>
+
+<h3>11.2 Single-threaded partitions (H-Store / VoltDB)</h3>
+<p>Each partition runs one stored procedure at a time, start to finish, with no concurrency control. Extremely fast for single-partition procedures. Multi-partition procedures lock entire partitions and become very slow. Our per-core scheduler borrows the "one thread owns the data" part but keeps record-level concurrency.</p>
+
+<h3>11.3 Optimistic concurrency (OCC, Silo, TicToc)</h3>
+<p>Run without intents, validate at commit. Great under low contention, but under contention it aborts the transaction that did the most work, and starvation is hard to bound. Wound-wait with fixed priorities gives a guarantee that every transaction eventually commits.</p>
+
+<h3>11.4 Wait-die instead of wound-wait</h3>
+<p>Wait-die is the mirror rule: older transactions wait, younger ones abort themselves on conflict. It is also deadlock-free. It aborts more often (the younger dies even when the older is about to finish), but never needs to reach a remote transaction to wound it. Worth benchmarking both; the decision is a single function in the scheduler.</p>
+
+<!-- ============================================================ -->
+<h2 id="prior">12. Prior art</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>System / paper</th><th>What we take from it</th></tr></thead>
+<tbody>
+<tr><td>Rosenkrantz, Stearns, Lewis — <em>System level concurrency control for distributed database systems</em> (1978)</td><td>Wound-wait and wait-die: priority by timestamp for deadlock-free distributed locking.</td></tr>
+<tr><td>Tomasulo (1967), out-of-order processors</td><td>Dataflow issue, register renaming, reorder buffer, speculation.</td></tr>
+<tr><td>Google Spanner (2012)</td><td>Paxos per shard, 2PC over replicated participants, external consistency with bounded clocks; uses wound-wait.</td></tr>
+<tr><td>CockroachDB</td><td>Write intents in the data, transaction record as a key, parallel commits, read refresh, HLC with uncertainty windows.</td></tr>
+<tr><td>Calvin (2012), SLOG, Aria</td><td>Deterministic transaction ordering; no 2PC.</td></tr>
+<tr><td>H-Store / VoltDB</td><td>Stored procedures as the unit of work; partition-owned execution.</td></tr>
+<tr><td>Percolator / TiDB</td><td>Timestamp oracle, lock-in-the-data design on top of a KV store.</td></tr>
+<tr><td>FoundationDB</td><td>Deterministic simulation testing — essential for building this safely.</td></tr>
+<tr><td>ScyllaDB / Seastar</td><td>Thread-per-core, shared-nothing execution, no latches.</td></tr>
+<tr><td>Kulkarni et al. — Hybrid Logical Clocks (2014)</td><td>Priority and timestamp generation without a central service.</td></tr>
+<tr><td>Redpanda</td><td>Thread-per-core combined with one Raft group per partition.</td></tr>
+<tr><td>SQL Server Froid (2019)</td><td>Procedural code compiled into the relational engine, in production.</td></tr>
+</tbody>
+</table></div>
+
+<h3 id="proof">12.1 Proof status of each mechanism</h3>
+<p>Design principle 3 says: only mechanisms already running in production. This table checks every mechanism in this document against it.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Mechanism</th><th>§</th><th>Status</th><th>Proven in / decision</th></tr></thead>
+<tbody>
+<tr><td>Wound-wait with age priority, kept across retries</td><td>5.1, 5.3</td><td><span class="tag lo">proven</span></td><td>Spanner (wound-wait; a retried transaction gains lock priority)</td></tr>
+<tr><td>Write intents in the record, transaction record as a key</td><td>5.2, 6.3</td><td><span class="tag lo">proven</span></td><td>CockroachDB, Percolator/TiDB</td></tr>
+<tr><td>Read timestamp tracking, phantom protection, read refresh</td><td>5.3, 5.4, 10.9</td><td><span class="tag lo">proven</span></td><td>CockroachDB timestamp cache and refresh</td></tr>
+<tr><td>HLC timestamps, uncertainty window, self-shutdown on clock drift</td><td>5.1, 8</td><td><span class="tag lo">proven</span></td><td>CockroachDB. Fallback: timestamp oracle (TiDB)</td></tr>
+<tr><td>User-chosen priority classes</td><td>5.5</td><td><span class="tag lo">proven</span></td><td>CockroachDB transaction priorities</td></tr>
+<tr><td>Automatic class promotion, priority inheritance</td><td>5.5, 5.6</td><td><span class="tag hi">not proven</span></td><td>Removed from the design; open questions</td></tr>
+<tr><td>Raft per shard, leader leases, witness, learners</td><td>6.2</td><td><span class="tag lo">proven</span></td><td>CockroachDB, TiKV, etcd, Spanner witnesses</td></tr>
+<tr><td>Parallel commits</td><td>6.3</td><td><span class="tag lo">proven</span></td><td>CockroachDB (since 2019)</td></tr>
+<tr><td>Thread-per-core execution with Raft</td><td>4.1</td><td><span class="tag lo">proven</span></td><td>ScyllaDB, Redpanda</td></tr>
+<tr><td>Interleaved tables</td><td>6.1</td><td><span class="tag md">mixed</span></td><td>Spanner has them; CockroachDB removed them. Replaced by key design.</td></tr>
+<tr><td>Server-side procedures, cached plans, sequences, statement-level rollback, cursor across commit</td><td>3, 7</td><td><span class="tag lo">proven</span></td><td>Oracle, VoltDB</td></tr>
+<tr><td>Automatic retry of a block</td><td>7.2</td><td><span class="tag lo">proven</span></td><td>Spanner/FoundationDB retry loops, CockroachDB automatic retries</td></tr>
+<tr><td>Per-shard batching (= MI fusion), write pipelining, bulk fetch</td><td>3.2, 3.4, 4.3</td><td><span class="tag lo">proven</span></td><td>CockroachDB, Oracle 10g+. <strong>This is the v1 execution model.</strong></td></tr>
+<tr><td>Same-key check at dispatch</td><td>3.2, 3.4</td><td><span class="tag md">simple, needed</span></td><td>Required for correctness as soon as statements are reordered. Not needed in program-order v1.</td></tr>
+<tr><td>Dataflow (SSA) parallel issue of independent statements</td><td>3.2</td><td><span class="tag hi">experiment</span></td><td>The core new idea. Built after v1, can be switched off, measured against v1.</td></tr>
+<tr><td>Speculative issue past an <code>IF</code></td><td>3.4</td><td><span class="tag hi">experiment</span></td><td>Off in v1</td></tr>
+<tr><td>Set-oriented loop rewriting</td><td>4.3</td><td><span class="tag hi">experiment</span></td><td>Research (Aggify, DBridge); scalar-function inlining (Froid) is in production</td></tr>
+<tr><td>Frame migration, escrow APPLY, deterministic fast path</td><td>4.2, 11.1, 13</td><td><span class="tag hi">not proven</span></td><td>Open questions only</td></tr>
+</tbody>
+</table></div>
+
+<!-- ============================================================ -->
+<h2 id="roadmap">13. Prototype roadmap and open questions</h2>
+
+<h3>Roadmap</h3>
+<ol>
+<li><strong>Single-node engine.</strong> MVCC store, intents, per-core MI scheduler, wound-wait. Hand-written MI programs, no compiler yet. Measure MIs per second per core.</li>
+<li><strong>Deterministic simulator.</strong> Run many nodes in one process with simulated network and clock; inject crashes and delays. Check serializability with a history checker (e.g. Elle). Do this <em>before</em> real networking — it is the only practical way to find bugs in this kind of system.</li>
+<li><strong>Sharding and Raft.</strong> Use an existing Raft library; range map; leases.</li>
+<li><strong>Cross-shard commit.</strong> Transaction record, 2PC, then parallel commits.</li>
+<li><strong>Compiler, subset of PL/SQL, proven techniques only.</strong> Variables, IF, point SQL, then cursors and loops, then exceptions, savepoints and transaction blocks. Program-order execution with pipelined writes, per-shard batching and bulk fetch.</li>
+<li><strong>The experiment.</strong> Dataflow analysis, parallel issue of independent statements with the same-key check, then speculation, then set-oriented loop rewriting. Each one can be switched off and is measured against step 5.</li>
+<li><strong>Benchmarks.</strong> TPC-C (its New-Order and Payment transactions are almost exactly stored procedures), plus a hot-key microbenchmark to tune priority classes and wound vs wait.</li>
+</ol>
+
+<h3>Open questions</h3>
+<ul>
+<li>Can deterministic execution (§11.1) and wound-wait coexist in one cluster, with one priority space?</li>
+<li>How aggressive should speculation be? A wrong speculative intent can block or wound another transaction for nothing.</li>
+<li>Should the coordinator frame migrate to the shard that receives most of a procedure's MIs, and how to decide that at run time?</li>
+<li>What is the right priority-class promotion policy for batch jobs that keep getting wounded?</li>
+<li>Is priority inheritance (boosting a lower-priority holder) worth it, given that the wait on a prepared transaction is already short?</li>
+<li>Can commutative <code>APPLY</code> MIs be merged at the record instead of conflicting (escrow transactions, O'Neil 1986)? This would help hot counters, but no mainstream SQL database ships it.</li>
+</ul>
+
+<div class="box warn">
+<p><strong>Bottom line.</strong> Your idea — compile procedural code into concurrent micro-instructions and resolve conflicts by priority, like a CPU — is sound and close to what the best distributed SQL systems already do internally. The one thing that cannot be removed is a small marker per written record (the intent): priorities decide who wins, intents tell a shard that there is a contest. With that compromise you get serializable transactions, no lock manager and no deadlock detection, and the main price is restarted work under contention and some restrictions on what the code may do before it commits.</p>
+<p>Every part of that is proven in production except one: issuing independent statements of the code in parallel, with speculation. That is the genuinely new part. It is built as a switchable experiment on top of a v1 that uses only proven techniques and already runs the example in about 200&nbsp;µs instead of 430&nbsp;µs (§9, §12.1).</p>
+</div>
+
+</main>
+</body>
+</html>

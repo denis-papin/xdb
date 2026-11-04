@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xdb-ir",
+    "crates/xdb-compiler",
+    "crates/xdb-checker",
+    "crates/xdb-core",
+    "crates/xdb-bench",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[profile.release]
+debug = 1
