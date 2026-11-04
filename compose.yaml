@@ -1,0 +1,18 @@
+# Build the xdb POC (the build also runs the full test suite) and run the benchmarks.
+#
+#   docker compose up --build                        full run, about 30 s
+#   XDB_ARGS=--quick docker compose up --build       short run, about 3 s
+#   XDB_ARGS="--only 1,3" docker compose up --build  selected experiments
+#
+# Results are written to ./bench/results.md and ./bench/results.csv.
+# The whole cluster is simulated inside one process, so there is one service.
+# Set XDB_USER="$(id -u):$(id -g)" to get the result files owned by you instead of root.
+
+services:
+  xdb-poc:
+    build: .
+    image: xdb-poc
+    user: "${XDB_USER:-0:0}"
+    command: --out /out ${XDB_ARGS:-}
+    volumes:
+      - ./bench:/out
