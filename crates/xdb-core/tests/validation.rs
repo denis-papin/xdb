@@ -72,7 +72,7 @@ fn transfer_latency_by_mode() {
         assert!(st.result.is_ok(), "{:?}", st.result);
         assert_eq!(balance(&sim, 10), START_BAL - 5);
         assert_eq!(balance(&sim, 150), START_BAL + 5);
-        assert_serializable(&sim, mode.name());
+        assert_serializable(&sim, &mode.name());
         println!("{:12} transfer latency {:7.1} us", mode.name(), st.latency_ns() as f64 / 1000.0);
         lat.push(st.latency_ns());
     }
@@ -88,7 +88,7 @@ fn insufficient_funds_undoes_speculative_writes() {
         assert_eq!(st.result.as_ref().unwrap_err().0, -20001, "{}", mode.name());
         assert_eq!(balance(&sim, 10), START_BAL);
         assert_eq!(balance(&sim, 150), START_BAL);
-        assert_serializable(&sim, mode.name());
+        assert_serializable(&sim, &mode.name());
     }
 }
 
@@ -100,7 +100,7 @@ fn transfer_to_self_keeps_balance() {
         let st = sim.call(1, Call::new("transfer", &[42, 42, 100]));
         assert!(st.result.is_ok());
         assert_eq!(balance(&sim, 42), START_BAL, "{}", mode.name());
-        assert_serializable(&sim, mode.name());
+        assert_serializable(&sim, &mode.name());
     }
 }
 
@@ -267,7 +267,7 @@ END p;
         assert_eq!(v(&sim, 2), Some(100));
         assert_eq!(v(&sim, 3), Some(3000));
         assert_eq!(v(&sim, 20), Some(0));
-        assert_serializable(&sim, mode.name());
+        assert_serializable(&sim, &mode.name());
     }
 }
 

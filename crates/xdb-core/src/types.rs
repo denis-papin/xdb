@@ -160,6 +160,8 @@ pub enum Msg {
 pub enum Ep {
     Coord(NodeId),
     Shard(ShardId),
+    /// The replica of a shard on a given node, serving follower reads.
+    Follower(ShardId, NodeId),
 }
 
 /// A message produced by a shard, sent after `extra_ns` (+ network latency).
@@ -171,3 +173,9 @@ pub struct Out {
     /// Add one replication delay (majority fsync) before sending.
     pub after_replication: bool,
 }
+
+/// Internal: a CHECK bound failed on a row version newer than the transaction's
+/// snapshot. If the transaction read anything, its reads are stale and it restarts
+/// (a serial execution would have seen that version); otherwise it is a normal
+/// CHECK violation.
+pub const CHECK_STALE: i32 = -22_900;

@@ -75,13 +75,18 @@ impl Setup {
 
 /// Bank cluster with `n_acc` accounts (ids 0..n_acc, range-sharded evenly).
 pub fn bank_sim(s: &Setup, n_acc: i64) -> Sim {
+    bank_sim_bal(s, n_acc, START_BAL)
+}
+
+/// Bank cluster whose accounts all start with balance `bal`.
+pub fn bank_sim_bal(s: &Setup, n_acc: i64, bal: i64) -> Sim {
     let p = compile(BANK_SQL, "bank.sql");
     let acc = tid(&p, "account");
     let ledger = tid(&p, "ledger");
     let cfg = s.cluster(vec![(acc, 0, n_acc - 1), (ledger, 0, 10_000_000)]);
     let mut sim = Sim::new(p, cfg).expect("bank sim");
     sim.load((0..n_acc).map(|i| {
-        (Key { table: acc, pk: i }, vec![Value::Int(i), Value::Int(START_BAL), Value::Str(format!("o{i}"))])
+        (Key { table: acc, pk: i }, vec![Value::Int(i), Value::Int(bal), Value::Str(format!("o{i}"))])
     }));
     sim
 }
@@ -289,6 +294,11 @@ pub const COLUMNS: &[&str] = &[
     "mis",
     "one_pc",
     "deltas",
+    "routed",
+    "follower_mis",
+    "refused",
+    "escrow_waits",
+    "min_balance",
     "invariant_ok",
     "serializable",
     "violations",
@@ -366,6 +376,8 @@ impl Rec {
             .set("mis", st.mis)
             .set("one_pc", st.one_pc)
             .set("deltas", st.deltas_issued)
+            .set("routed", st.routed)
+            .set("follower_mis", st.follower_reads)
     }
 }
 

@@ -273,3 +273,118 @@ END rd;
         }
     }
 }
+
+fn bank_prog() -> Program {
+    // bank.sql includes get_balance (a read-only procedure).
+    compile(&std::fs::read_to_string(format!("{}/../../workloads/bank.sql", env!("CARGO_MANIFEST_DIR"))).unwrap())
+}
+
+fn bank_cluster(mode: ExecMode, n: i64) -> Sim {
+    let cfg = ClusterConfig { shards: 3, mode, table_ranges: vec![(0, 0, n - 1), (1, 0, 10_000_000)], ..Default::default() };
+    let mut s = Sim::new(bank_prog(), cfg).unwrap();
+    s.load((0..n).map(|i| (Key { table: 0, pk: i }, vec![Value::Int(i), Value::Int(100), Value::Null])));
+    s
+}
+
+#[test]
+fn routing_runs_the_call_where_the_data_is() {
+    let mut lat = vec![];
+    for mode in [ExecMode::v1(), ExecMode::v1().with_routing()] {
+        let mut s = bank_cluster(mode, 300);
+        // Account 150 is on shard 1 (node 1); the client connects to node 2.
+        let st = s.call(2, Call::new("deposit", &[150, 7]));
+        assert!(st.result.is_ok());
+        ok_serial(&s);
+        println!("{:12} deposit from node 2: {:6.1} us (node used: {})", mode.name(), st.latency_ns() as f64 / 1000.0, st.node);
+        lat.push(st.latency_ns());
+        if mode.routing {
+            assert_eq!(st.node, 1);
+        }
+    }
+    assert!(lat[1] < lat[0]);
+}
+
+#[test]
+fn implicit_sfu_locks_read_then_updated_rows() {
+    for mode in [ExecMode::v1(), ExecMode::v1().with_sfu(), ExecMode::best().with_sfu()] {
+        let mut s = bank_cluster(mode, 10);
+        let mut gen = |r: &mut Rng, _c: usize| Call::new("transfer", &[r.range_i64(0, 9), r.range_i64(0, 9), 1]);
+        let rep = s.run_closed_loop(48, 4_000_000, 0, &mut gen);
+        ok_serial(&s);
+        let total: i64 = (0..10).map(|i| s.committed(Key { table: 0, pk: i }).unwrap()[1].as_int().unwrap()).sum();
+        assert_eq!(total, 1000, "{}", mode.name());
+        println!(
+            "{:24} ok {:5} thr {:7.0}/s p99 {:8.1}us restarts w{} r{}",
+            mode.name(),
+            rep.ok_calls(),
+            rep.throughput(),
+            rep.latency_us(99.0, None),
+            rep.stats.restart_wounded,
+            rep.stats.restart_refresh
+        );
+    }
+}
+
+#[test]
+fn follower_reads_are_consistent_and_off_the_leader() {
+    for mode in [ExecMode::v1().with_follower_reads(), ExecMode::best().with_sfu().with_routing().with_follower_reads()] {
+        let mut s = bank_cluster(mode, 60);
+        let mut gen = |r: &mut Rng, _c: usize| {
+            if r.chance(0.5) {
+                Call::new("audit_total", &[0, 59])
+            } else {
+                Call::new("transfer", &[r.range_i64(0, 59), r.range_i64(0, 59), r.range_i64(1, 50)])
+            }
+        };
+        let rep = s.run_closed_loop(32, 8_000_000, 0, &mut gen);
+        ok_serial(&s);
+        for a in rep.calls.iter().filter(|c| c.proc == "audit_total") {
+            assert_eq!(a.output, vec!["6000".to_string()], "{}: torn audit", mode.name());
+        }
+        assert!(s.stats.follower_reads > 100, "{}: follower reads not used", mode.name());
+        println!("{:40} follower MIs {} audits p50 {:6.1}us", mode.name(), s.stats.follower_reads, rep.latency_us(50.0, Some("audit_total")));
+    }
+}
+
+#[test]
+fn escrow_bounds_never_overdraw() {
+    // Small balances and large amounts: many transfers must be refused. Whatever the
+    // mode, no balance may go below 0, money is conserved, and the history is
+    // serializable. With escrow, debits are accepted on worst-case bounds only.
+    let p = bank_prog();
+    for mode in ExecMode::extended() {
+        for rule in [ConflictRule::WoundWait, ConflictRule::WaitDie] {
+            let n = 20i64;
+            let cfg = ClusterConfig { shards: 3, mode, rule, seed: 7, table_ranges: vec![(0, 0, n - 1), (1, 0, 10_000_000)], ..Default::default() };
+            let mut s = Sim::new(p.clone(), cfg).unwrap();
+            s.load((0..n).map(|i| (Key { table: 0, pk: i }, vec![Value::Int(i), Value::Int(50), Value::Null])));
+            let mut gen = |r: &mut Rng, _c: usize| {
+                let proc = if r.chance(0.7) { "transfer_escrow" } else { "transfer" };
+                Call::new(proc, &[r.range_i64(0, n - 1), r.range_i64(0, n - 1), r.range_i64(1, 40)])
+            };
+            let rep = s.run_closed_loop(32, 4_000_000, 0, &mut gen);
+            let label = format!("{} {:?}", mode.name(), rule);
+            ok_serial(&s);
+            let bal: Vec<i64> = (0..n).map(|i| s.committed(Key { table: 0, pk: i }).unwrap()[1].as_int().unwrap()).collect();
+            assert!(bal.iter().all(|b| *b >= 0), "{label}: overdraft {bal:?}");
+            assert_eq!(bal.iter().sum::<i64>(), n * 50, "{label}: money");
+            let refused = rep.calls.iter().filter(|c| matches!(c.result, Err((-2290, _)))).count();
+            for c in &rep.calls {
+                if let Err((code, _)) = &c.result {
+                    assert!(*code == -2290 || *code == -20001, "{label}: {code}");
+                }
+            }
+            assert!(refused > 0, "{label}: no CHECK refusal at all");
+            let st = s.shard_stats();
+            if mode == ExecMode::best() && rule == ConflictRule::WoundWait {
+                println!(
+                    "{label}: ok {} refused {} escrow waits {} fails {}",
+                    rep.ok_calls(),
+                    refused,
+                    st.iter().map(|x| x.escrow_wait).sum::<u64>(),
+                    st.iter().map(|x| x.escrow_fail).sum::<u64>()
+                );
+            }
+        }
+    }
+}

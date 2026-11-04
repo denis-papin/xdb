@@ -87,6 +87,17 @@ pub struct TableDef {
     pub columns: Vec<ColumnDef>,
     /// Position of the primary-key column (type Number).
     pub pk_col: ColId,
+    /// `CHECK (col >= n)`-style bounds on integer columns (inclusive). Enforced on
+    /// every write; escrow deltas are accepted only if the bound holds in the worst
+    /// case of all pending deltas (O'Neil escrow).
+    pub checks: Vec<ColCheck>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColCheck {
+    pub col: ColId,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +148,8 @@ pub mod errcode {
     pub const SNAPSHOT_TOO_OLD: i32 = -1555;
     /// Fetch out of sequence (ORA-01002).
     pub const FETCH_OUT_OF_SEQUENCE: i32 = -1002;
+    /// Check constraint violated (ORA-02290).
+    pub const CHECK_VIOLATION: i32 = -2290;
     // RAISE_APPLICATION_ERROR uses -20000 ..= -20999.
 }
 

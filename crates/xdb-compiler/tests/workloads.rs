@@ -91,3 +91,17 @@ fn tpcc_compiles() {
     let p = prog.procedure("payment").unwrap();
     assert_eq!(p.body.iter().filter(|s| matches!(s, Stmt::Update { .. })).count(), 3);
 }
+
+#[test]
+fn check_bounds_are_parsed() {
+    let p = xdb_compiler::compile(
+        "CREATE TABLE t (id NUMBER PRIMARY KEY, v NUMBER CHECK (v >= 0), w NUMBER, CHECK (w < 10), CHECK (w > -5));",
+    )
+    .unwrap();
+    let t = &p.schema.tables[0];
+    assert_eq!(t.checks.len(), 2);
+    assert_eq!(t.checks[0], xdb_ir::ColCheck { col: 1, min: Some(0), max: None });
+    assert_eq!(t.checks[1], xdb_ir::ColCheck { col: 2, min: Some(-4), max: Some(9) });
+    assert!(xdb_compiler::compile("CREATE TABLE t (id NUMBER PRIMARY KEY, v NUMBER CHECK (w >= 0), w NUMBER);").is_err());
+    assert!(xdb_compiler::compile("CREATE TABLE t (id NUMBER PRIMARY KEY, s VARCHAR2(5), CHECK (s >= 0));").is_err());
+}

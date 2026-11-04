@@ -141,10 +141,90 @@ All 155 benchmark runs and the extended test suite (now run in all 10 modes) are
     - Together they give the best result on every contended workload: ×3.1 to ×3.8 throughput (bank hot spot 13.2k → 41.6k; TPC-C 1 warehouse 10.7k → 40.1k) and the best p99 (bank hot spot 3.98 ms vs 7.1 ms).
     - Speculation alone helps little under contention, but combined with escrow it more than doubles escrow's gain on the hot spot (23.8k → 41.6k).
 
-**Recommendation.** Ship `+1pc` in the proven core. Keep escrow and speculation as switchable experiments, but treat escrow as the first experiment to harden: it gives the largest measured gain on contended data.
+### Improvements round 2 (section 8 of `bench/results.md`)
+
+Three more proven techniques:
+- **`+sfu` (implicit `SELECT ... FOR UPDATE`, CockroachDB):** a read of a row that the same block later updates takes the write intent at once. The compiler pass skips it when the later update is an escrow delta (see finding 14).
+- **`+route` (leaseholder routing):** a call runs on the node that leads most of its keys. Keys computed from the parameters (such as composite keys) count; read-only calls go to a node holding a follower replica.
+- **`+follower` (follower reads at a closed timestamp, Spanner / CockroachDB):**
+  - Read-only procedures read at `now − 2 ms`, on a follower replica on their own node when there is one.
+  - New writes are pushed above that closed timestamp.
+  - A follower read waits for pending writes at or below its timestamp.
+
+| calls/s (3 shards) | v1 | v1+sfu | **proven core** v1+1pc+sfu+route+follower | best (speculative+1pc+escrow) | **best + sfu+route+follower** |
+|---|---|---|---|---|---|
+| bank, 10,000 accounts | 249k | 250k | 261k | 251k | 262k |
+| bank, 100 accounts | 91k | 117k | 134k | 183k | **205k** |
+| bank, 10 accounts | 13.2k | 16.8k | 19.4k | 41.6k | **47.8k** |
+| bank read-heavy (80% point reads, 128 clients) | 681k | 681k | 1,130k | 681k | **1,131k** |
+| TPC-C lite, 1 warehouse | 10.7k | 10.7k | 13.1k | 40.1k | **43.3k** |
+| TPC-C lite, 4 warehouses | 41.5k | 41.5k | 54.6k | 114.5k | **123.6k** |
+
+| idle latency, client on the "wrong" node | v1 | best | best + route |
+|---|---|---|---|
+| deposit (1 shard) | 203 µs | 148 µs | **94 µs** |
+| transfer (2 shards + ledger) | 264 µs | 207 µs | **150 µs** |
+
+14. **Implicit `FOR UPDATE` is a big win for the proven core, and it conflicts with escrow.**
+    - On v1, bank at 100 accounts goes from 91k to 117k calls/s (+30%), and aborts per commit fall from 0.71 to 0.13. Hot spot: +27% throughput, p99 7.1 → 5.1 ms.
+    - The first version also locked rows that escrow would update as deltas. That blocked the other transactions' deltas and **cut hot-spot throughput by 39%** (41.6k → 25.3k).
+    - The fix: no implicit lock when the later update is delta-shaped and escrow is on. With that, it's neutral on top of escrow.
+    - TPC-C is unchanged: new_order already uses `FOR UPDATE`, and payment doesn't read before writing.
+15. **Routing cuts latency by 27–37%, and helps contended loads.**
+    - Under load: hot spot +15%; TPC-C 4 warehouses +8% on the best mode, and +31% within the proven core.
+    - Pitfall found: routing by the *first* key made payment slower (150 → 206 µs), because its other keys are computed from a local variable. Voting over all keys, after evaluating simple assignments, fixed it.
+16. **Follower reads move read load off the leaders.**
+    - Read-heavy mix: +66% throughput (681k → 1.13M calls/s); p50 75 → 12.5 µs (9.2 µs with routing), because the read is served by the local replica.
+    - The price: read-only procedures see data 2 ms old. They still see a consistent snapshot: every concurrent audit sees exactly the constant total.
+    - Pitfall found: routing first sent read-only calls to the leader's node, losing the local follower (p50 69 µs). Read-only calls now route to a follower's node.
+17. **The proven core is much stronger than v1.**
+    - v1 + one-phase commit + implicit `FOR UPDATE` + routing + follower reads, all proven elsewhere, gives +48% on bank 100, +47% on the hot spot, +66% read-heavy and +31% on TPC-C 4 warehouses, at no correctness cost.
+    - The experiments (escrow, speculation) still add the most on hot counters: TPC-C with 1 warehouse goes from 13.1k (proven core) to 43.3k (everything).
+
+### Bounded escrow (section 9 of `bench/results.md`)
+
+Point 8 of the improvement list: **O'Neil escrow with bounds**.
+
+**The SQL side.** Tables can declare `CHECK (col >= n)` bounds (also `>`, `<=`, `<`). Every write that would break one fails with ORA-02290 (code −2290).
+
+**The shard side.** With escrow on, a debit is a delta, and the shard accepts it only if the bound holds **in the worst case** over all pending deltas on that row:
+- `base + Σ pending debits + my delta ≥ min` → accept;
+- `base + Σ pending credits + my delta < min` → refuse, the bound breaks even in the best case;
+- otherwise → wait. Under wound-wait, an older debit wounds the younger pending deltas it depends on; a younger one waits.
+
+Any subset of pending deltas can then commit, in any order, without breaking the bound.
+
+**The workload.** `transfer_escrow` debits without reading the balance and relies on `CHECK (balance >= 0)`. The guarded `transfer` reads the balance, checks it in an `IF`, then debits.
+
+**Two bugs found by the new tests, both fixed.**
+- **Overdraft, under wait-die.** A debit that could only be covered by *other transactions' pending credits* was accepted without waiting for them. If they abort, the balance goes negative (−45 in the test). The shard now waits on every pending delta whose outcome matters.
+- **Wrong error code.** The guarded `transfer` passed its `IF` on its snapshot, then the CHECK refused the debit because of transactions that committed after that snapshot. A serial execution would have raised the `IF`'s error instead. Now a CHECK that fails on data newer than the snapshot of a transaction that has read something restarts it with a fresh snapshot. With speculation, reads still in flight count too.
+
+**Test.** A dedicated test runs every mode and both conflict rules on accounts starting at 50, with amounts up to 40: no balance ever goes below 0, money is conserved, and every history is serializable.
+
+| transfers/s, 64 clients | guarded `transfer`, v1 | `transfer_escrow`, v1 | guarded, best (spec+1pc+escrow) | `transfer_escrow`, best | `transfer_escrow`, everything |
+|---|---|---|---|---|---|
+| 100 accounts, balance 1000 | 77k | 97k | 163k | **249k** | 250k |
+| 10 accounts, balance 1000 (hot spot) | 11.1k | 14.0k | 34.0k | **164k** | 168k |
+| 100 accounts, balance 100 (near the bound) | 65k | 72k | 85k | **124k** | 131k |
+| 10 accounts, balance 100 | 9.1k | 11.2k | 22.8k | **49.5k** | 53.9k |
+
+18. **Bounded escrow is the biggest single gain of the POC.**
+    - On the hot spot with rich accounts: 34k → 164k transfers/s (×4.8), p99 4.2 → 1.4 ms, aborts per commit 4.4 → 0.14.
+    - Overall, the guarded `transfer` in v1 does 11.1k/s and `transfer_escrow` with every improvement does 168k/s: **×15** on the same hot spot.
+19. **The bounds cost little when they don't bind, and still win when they do.**
+    - With poor accounts (most debits near 0), many debits must wait for pending ones (≈76k escrow waits on 10 accounts), yet throughput is still ×2.2 better than the guarded transfer.
+    - The share of refused transfers is about the same as with the guarded version, so the worst-case rule is not overly pessimistic here.
+20. **Escrow-style code helps even without escrow.** In v1, `transfer_escrow` beats the guarded transfer by 26% (rich accounts, 100): it has no read, so no failed read re-checks at commit.
+21. **The price is a programming model.**
+    - The overdraft rule moves from procedural code (`IF v_bal < p_amt THEN RAISE`) to a declarative constraint, and the error becomes −2290 instead of the application's −20001.
+    - Only bounds on single integer columns are supported, which covers balances, stock quantities and seat counts.
+    - An unknown account is silently ignored (0 rows) instead of raising NO_DATA_FOUND.
+
+**Recommendation.** Ship `+1pc`, `+sfu`, `+route` and `+follower` in the proven core. Keep escrow and speculation as switchable experiments, but treat escrow as the first experiment to harden: it gives the largest measured gain on contended data.
 
 Escrow limitations in the POC:
-- No bounds check. O'Neil's full escrow also guarantees, for example, `balance ≥ 0` without reading the row. Here a transaction that needs the value still reads it, and that read is validated normally.
+- Bounds are now supported through `CHECK` constraints; see "Bounded escrow" below.
 - Only `c = c ± constant` is recognized.
 - The final value of a delta is not returned to the statement. That's fine for `UPDATE`; a `RETURNING` clause would need the read.
 
@@ -197,8 +277,12 @@ Each comes with its own simulated tests.
 | One-phase commit when a block's writes all go to one shard | CockroachDB 1PC | **Done** (`+1pc`): single-shard block −27% latency; no throughput change (findings 11–13) |
 | Refresh only the shards that were actually read | CockroachDB refresh spans | **Done**, part of `+1pc` |
 | Stage the commit in parallel with the last writes | CockroachDB parallel commits | **Not cheap.** A staged transaction can no longer be wounded. If one of its in-flight writes then waits for an older transaction, the two wait for each other. CockroachDB avoids this with a "transaction recovery" protocol (others check whether all writes landed, and if not, prevent the missing one and abort). Step 1 material. |
+| Implicit `SELECT ... FOR UPDATE` (not for escrow deltas) | CockroachDB | **Done** (`+sfu`): +30% on contended bank (finding 14) |
+| Route each call to the node leading most of its keys | Leaseholder routing (CockroachDB, Spanner) | **Done** (`+route`): −27 to −37% latency (finding 15) |
+| Follower reads at a closed timestamp for read-only procedures | Spanner stale reads, CockroachDB follower reads | **Done** (`+follower`): +66% on read-heavy load (finding 16) |
 | Per-key wait queues instead of re-polling parked operations | CockroachDB lock table | Step 1 material |
 | Commutative updates (escrow, O'Neil 1986) for hot counters | Research, not in mainstream SQL engines | **Experiment** (`+escrow`): ×2–3 throughput on contended workloads, serializable in every test (findings 11–13) |
+| Escrow with bounds: `CHECK (col >= n)` guaranteed on worst-case pending deltas | O'Neil 1986 (research) | **Experiment**, done: up to ×4.8 on hot-spot transfers written escrow-style, never an overdraft (findings 18–21) |
 
 ## What is not proven by this POC
 

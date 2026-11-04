@@ -83,6 +83,8 @@ pub struct Code {
     /// Variables read / written by each instruction (for the lookahead window).
     pub reads: Vec<Vec<VarId>>,
     pub writes: Vec<Vec<VarId>>,
+    /// No statement writes or locks: eligible for follower reads.
+    pub read_only: bool,
 }
 
 const PATCH: usize = usize::MAX;
@@ -328,7 +330,72 @@ fn rw(ins: &Ins) -> (Vec<VarId>, Vec<VarId>) {
     (r, w)
 }
 
-pub fn lower(p: &Procedure) -> Result<Code, String> {
+/// Implicit `SELECT ... FOR UPDATE` (CockroachDB): a point read of a row that a later
+/// UPDATE or DELETE of the same block targets with the same key expression takes the
+/// write intent at once, instead of failing a read refresh or being wounded later.
+/// The scan stops at the end of the block (COMMIT / ROLLBACK / END) or when a
+/// variable of the key is reassigned.
+/// `c = c + e` / `c = c - e` / `c = e + c` for every assignment, with `e` free of
+/// `OldCol`: the shape that escrow turns into a commutative delta.
+pub fn delta_shaped(sets: &[(ColId, Expr)]) -> bool {
+    fn no_old(e: &Expr) -> bool {
+        match e {
+            Expr::OldCol(_) => false,
+            Expr::Const(_) | Expr::Var(_) | Expr::Col(..) => true,
+            Expr::Unary(_, a) | Expr::IsNull(a) => no_old(a),
+            Expr::Binary(_, a, b) => no_old(a) && no_old(b),
+            Expr::Coalesce(l) => l.iter().all(no_old),
+        }
+    }
+    !sets.is_empty()
+        && sets.iter().all(|(c, e)| match e {
+            Expr::Binary(BinOp::Add, a, b) => {
+                (matches!(a.as_ref(), Expr::OldCol(x) if x == c) && no_old(b))
+                    || (matches!(b.as_ref(), Expr::OldCol(x) if x == c) && no_old(a))
+            }
+            Expr::Binary(BinOp::Sub, a, b) => matches!(a.as_ref(), Expr::OldCol(x) if x == c) && no_old(b),
+            _ => false,
+        })
+}
+
+/// With escrow on, an UPDATE that will become a delta must not be preceded by an
+/// implicit lock: the lock would block other transactions' deltas on the row.
+fn implicit_sfu(ins: &mut [Ins], writes: &[Vec<VarId>], escrow: bool) -> usize {
+    let mut n = 0;
+    for i in 0..ins.len() {
+        let Ins::Data(DataOp::Get { table, key, for_update: false, .. }) = &ins[i] else { continue };
+        let (table, key) = (*table, key.clone());
+        let mut kv = vec![];
+        expr_vars(&key, &mut kv);
+        let mut hit = false;
+        for j in i + 1..ins.len() {
+            match &ins[j] {
+                Ins::Commit | Ins::Rollback | Ins::End => break,
+                Ins::Data(DataOp::Update { table: t, key: k, sets, .. }) if *t == table && *k == key => {
+                    hit = !(escrow && delta_shaped(sets));
+                    break;
+                }
+                Ins::Data(DataOp::Delete { table: t, key: k, .. }) if *t == table && *k == key => {
+                    hit = true;
+                    break;
+                }
+                _ => {}
+            }
+            if writes[j].iter().any(|w| kv.contains(w)) {
+                break;
+            }
+        }
+        if hit {
+            if let Ins::Data(DataOp::Get { for_update, .. }) = &mut ins[i] {
+                *for_update = true;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+pub fn lower(p: &Procedure, sfu: bool, escrow: bool) -> Result<Code, String> {
     let mut l = Lower { ins: vec![], handlers: vec![], n_cursors: 0, loops: vec![], depth: 0 };
     for v in &p.vars {
         if let Some(init) = &v.init {
@@ -337,8 +404,18 @@ pub fn lower(p: &Procedure) -> Result<Code, String> {
     }
     l.block(&p.body, &p.handlers)?;
     l.emit(Ins::End);
-    let (reads, writes) = l.ins.iter().map(rw).unzip();
+    let (reads, writes): (Vec<_>, Vec<_>) = l.ins.iter().map(rw).unzip();
+    if sfu {
+        implicit_sfu(&mut l.ins, &writes, escrow);
+    }
+    let read_only = l.ins.iter().all(|i| match i {
+        Ins::Data(DataOp::Get { for_update, .. }) | Ins::Data(DataOp::ScanOpen { for_update, .. }) => !for_update,
+        Ins::Data(DataOp::Aggregate { .. }) => true,
+        Ins::Data(_) => false,
+        _ => true,
+    });
     Ok(Code {
+        read_only,
         name: p.name.clone(),
         ins: l.ins,
         handlers: l.handlers,

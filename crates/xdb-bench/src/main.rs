@@ -1,6 +1,6 @@
 //! xdb-bench: runs the POC experiments and writes `results.md` and `results.csv`.
 //!
-//! Usage: xdb-bench [--out <dir>] [--quick] [--only <1..7>[,..]]
+//! Usage: xdb-bench [--out <dir>] [--quick] [--only <1..9>[,..]]
 //!
 //! Every run is a fresh deterministic simulation; every run that executes
 //! transactions is checked by xdb-checker. Exit code 1 if any run is not
@@ -226,6 +226,105 @@ fn improvement_modes() -> Vec<ExecMode> {
         ExecMode::speculative(),
         ExecMode::speculative().with_fast_path().with_escrow(),
     ]
+}
+
+/// Second round of improvements, on top of the best mode of round 1.
+fn round2_modes() -> Vec<ExecMode> {
+    let b = ExecMode::best();
+    let proven = ExecMode::v1().with_fast_path().with_sfu().with_routing().with_follower_reads();
+    vec![
+        ExecMode::v1(),
+        ExecMode::v1().with_sfu(),
+        proven,
+        b,
+        b.with_sfu(),
+        b.with_routing(),
+        b.with_follower_reads(),
+        b.with_sfu().with_routing().with_follower_reads(),
+    ]
+}
+
+/// Read-heavy bank mix: 80% single-row balance reads, 20% transfers.
+fn bank_read_run(exp: &str, label: &str, setup: &Setup, n_acc: i64, dur: u64) -> Rec {
+    let t0 = Instant::now();
+    let mut sim = bank_sim(setup, n_acc);
+    let mut gen = |r: &mut Rng, _c: usize| {
+        if r.chance(0.8) {
+            Call::new("get_balance", &[r.range_i64(0, n_acc - 1)])
+        } else {
+            Call::new("transfer", &[r.range_i64(0, n_acc - 1), r.range_i64(0, n_acc - 1), r.range_i64(1, 300)])
+        }
+    };
+    let rep = sim.run_closed_loop(CLIENTS * 2, dur, 0, &mut gen);
+    let mut rec = Rec::new(exp, label);
+    rec.setup(setup).set("workload", "bank-read").set("clients", CLIENTS * 2).set("accounts", n_acc).report(&rep, dur);
+    rec.setf("transfer_p99_us", lat_us(rep.calls.iter().filter(|c| c.proc == "transfer"), 99.0));
+    let unexpected = rep.calls.iter().any(|c| matches!(&c.result, Err((code, _)) if *code != -20001));
+    rec.set("invariant_ok", bank_total(&sim, n_acc) == n_acc * START_BAL && !unexpected);
+    finish(&mut rec, &sim, t0);
+    rec
+}
+
+fn exp8(o: &Opts, recs: &mut Vec<Rec>) {
+    eprintln!("== 8. improvements round 2: implicit FOR UPDATE, routing, follower reads");
+    for mode in round2_modes() {
+        let s = Setup { mode, seed: SEED, ..Default::default() };
+        let n = mode.name();
+        let call = Call::new("deposit", &[150, 7]);
+        let mut r = idle("8-idle", &format!("deposit idle {n}"), &s, bank_sim(&s, BANK_ACC_IDLE), 2, &call, o.idle_reps(), "bank");
+        r.set("accounts", BANK_ACC_IDLE);
+        recs.push(r);
+        recs.push(idle_transfer("8-idle", &s, o.idle_reps()));
+        let pay = Call::new("payment", &[0, 5, 7, 100]);
+        let mut r = idle("8-idle", &format!("payment idle {n}"), &s, tpcc_sim(&s, 1), 1, &pay, o.idle_reps(), "tpcc_lite");
+        r.set("warehouses", 1);
+        recs.push(r);
+        for n_acc in [10_000, 100, 10] {
+            recs.push(bank_run("8-load", &format!("bank {n_acc} acc {n}"), &s, n_acc, CLIENTS, o.dur(100)));
+        }
+        recs.push(bank_read_run("8-load", &format!("bank read-heavy {n}"), &s, 10_000, o.dur(100)));
+        for w in [1, 4] {
+            recs.push(tpcc_run("8-load", &format!("tpcc {w}w {n}"), &s, w, o.dur(100)));
+        }
+    }
+}
+
+/// Transfers only: the guarded `transfer` (read the balance, IF, debit) or the
+/// escrow-style `transfer_escrow` (debit bounded by CHECK (balance >= 0)).
+fn transfer_run(exp: &str, setup: &Setup, proc: &str, n_acc: i64, bal: i64, max_amt: i64, dur: u64) -> Rec {
+    let t0 = Instant::now();
+    let mut sim = bank_sim_bal(setup, n_acc, bal);
+    let p = proc.to_string();
+    let mut gen = |r: &mut Rng, _c: usize| Call::new(&p, &[r.range_i64(0, n_acc - 1), r.range_i64(0, n_acc - 1), r.range_i64(1, max_amt)]);
+    let rep = sim.run_closed_loop(CLIENTS, dur, 0, &mut gen);
+    let label = format!("{proc} {n_acc} acc bal {bal} {}", setup.mode.name());
+    let mut rec = Rec::new(exp, &label);
+    rec.setup(setup).set("workload", proc).set("clients", CLIENTS).set("accounts", n_acc).report(&rep, dur);
+    let refused = rep.calls.iter().filter(|c| matches!(c.result, Err((-2290, _)) | Err((-20001, _)))).count();
+    let unexpected = rep.calls.iter().any(|c| matches!(&c.result, Err((code, _)) if *code != -20001 && *code != -2290));
+    let acc = tid(&sim.program, "account");
+    let min_bal = (0..n_acc).filter_map(|i| sim.committed(Key { table: acc, pk: i })).filter_map(|r| r[1].as_int()).min().unwrap_or(0);
+    let waits: u64 = sim.shard_stats().iter().map(|x| x.escrow_wait).sum();
+    rec.set("refused", refused).set("escrow_waits", waits).set("min_balance", min_bal);
+    rec.set("invariant_ok", !unexpected && min_bal >= 0 && bank_total(&sim, n_acc) == n_acc * bal);
+    finish(&mut rec, &sim, t0);
+    rec
+}
+
+fn exp9(o: &Opts, recs: &mut Vec<Rec>) {
+    eprintln!("== 9. bounded escrow: guarded transfer vs transfer_escrow");
+    let b = ExecMode::best();
+    let modes = [ExecMode::v1(), ExecMode::v1().with_sfu(), b, b.with_sfu().with_routing().with_follower_reads()];
+    // (accounts, initial balance, max amount): rich accounts (bounds rarely matter)
+    // and poor accounts (most debits are near the bound).
+    for (n_acc, bal, max_amt) in [(100, 1000, 300), (10, 1000, 300), (100, 100, 300), (10, 100, 300)] {
+        for mode in modes {
+            let s = Setup { mode, seed: SEED, ..Default::default() };
+            for proc in ["transfer", "transfer_escrow"] {
+                recs.push(transfer_run("9-escrow", &s, proc, n_acc, bal, max_amt, o.dur(100)));
+            }
+        }
+    }
 }
 
 fn exp7(o: &Opts, recs: &mut Vec<Rec>) {
@@ -512,6 +611,56 @@ Commit waits for a majority of replicas (leader included): 2 replicas = both, 3 
         "7-load",
         &imp_cols,
     );
+
+    section(
+        &mut md,
+        "8a. Improvements round 2 — idle latency",
+        "`best` = speculative+1pc+escrow (the best mode of section 7), plus implicit `FOR UPDATE` (`+sfu`), routing each call to the node of its first key (`+route`) and follower reads at a closed timestamp 2 ms in the past (`+follower`). All three are proven techniques. Calls are sent by the client to node 2 (deposit, transfer) or node 1 (payment).",
+        recs,
+        "8-idle",
+        &idle_cols,
+    );
+    let r2_cols = [
+        ("label", "run"),
+        ("mode", "mode"),
+        ("throughput", "calls/s"),
+        ("p50_us", "p50 us"),
+        ("p99_us", "p99 us"),
+        ("transfer_p99_us", "transfer p99"),
+        ("new_order_p99_us", "new_order p99"),
+        ("aborts_per_commit", "aborts/commit"),
+        ("routed", "routed calls"),
+        ("follower_mis", "follower MIs"),
+        ("serializable", "serializable"),
+    ];
+    section(
+        &mut md,
+        "8b. Improvements round 2 — under load",
+        "Same loads as 7b, plus a read-heavy bank mix (80% single-row `get_balance`, 20% transfers, 128 clients, 10,000 accounts) where follower reads can take load off the shard leaders.",
+        recs,
+        "8-load",
+        &r2_cols,
+    );
+
+    let esc_cols = [
+        ("label", "run"),
+        ("throughput", "calls/s"),
+        ("p50_us", "p50 us"),
+        ("p99_us", "p99 us"),
+        ("refused", "refused"),
+        ("aborts_per_commit", "aborts/commit"),
+        ("escrow_waits", "escrow waits"),
+        ("min_balance", "min balance"),
+        ("serializable", "serializable"),
+    ];
+    section(
+        &mut md,
+        "9. Bounded escrow (O'Neil) — guarded vs escrow-style transfer",
+        "Transfers only, 64 clients, 3 shards x 3 replicas. `transfer` reads the balance, checks it in an IF and then debits; `transfer_escrow` only debits and relies on `CHECK (balance >= 0)` (with escrow on, the debit is accepted only if the bound holds in the worst case of all pending debits). `refused` = insufficient-funds outcomes (-20001 or -2290). Rich accounts start at 1000, poor ones at 100; amounts 1..300. `min balance` must stay >= 0.",
+        recs,
+        "9-escrow",
+        &esc_cols,
+    );
     md
 }
 
@@ -519,8 +668,8 @@ fn main() {
     let o = parse_args();
     let t0 = Instant::now();
     let mut recs: Vec<Rec> = vec![];
-    let exps: [(u32, fn(&Opts, &mut Vec<Rec>)); 7] =
-        [(1, exp1), (2, exp2), (3, exp3), (4, exp4), (5, exp5), (6, exp6), (7, exp7)];
+    let exps: [(u32, fn(&Opts, &mut Vec<Rec>)); 9] =
+        [(1, exp1), (2, exp2), (3, exp3), (4, exp4), (5, exp5), (6, exp6), (7, exp7), (8, exp8), (9, exp9)];
     for (n, f) in exps {
         if o.only.is_empty() || o.only.contains(&n) {
             f(&o, &mut recs);

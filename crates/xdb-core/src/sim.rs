@@ -69,11 +69,14 @@ pub struct SimStats {
     pub one_pc: u64,
     pub one_pc_fallback: u64,
     pub deltas_issued: u64,
+    pub follower_reads: u64,
+    pub routed: u64,
+    pub restart_check: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct RunReport {
-    pub mode: &'static str,
+    pub mode: String,
     pub sim_ns: u64,
     pub calls: Vec<CallStat>,
     pub stats: SimStats,
@@ -116,6 +119,8 @@ enum Event {
     ShardService(ShardId),
     Run(SessionId),
     Client(usize),
+    FollowerService(ShardId, NodeId),
+    FollowerRetry(ShardId, NodeId, Mi),
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +208,8 @@ struct Attempt {
     phase: Phase,
     deferred_err: Option<(i32, String)>,
     tried_1pc: bool,
+    /// Read-only attempt served by follower replicas at a closed timestamp.
+    follower: bool,
 }
 
 impl Attempt {
@@ -225,6 +232,7 @@ impl Attempt {
             phase: Phase::None,
             deferred_err: None,
             tried_1pc: false,
+            follower: false,
         }
     }
     fn outstanding(&self) -> usize {
@@ -287,6 +295,9 @@ pub struct Sim {
     history: History,
     hist_index: HashMap<TxnId, usize>,
     early_patches: HashMap<TxnId, Vec<(Key, Option<Row>)>>,
+    /// Follower-read queues (one core per replica), keyed by (shard, node).
+    followers: HashMap<(ShardId, NodeId), (std::collections::VecDeque<Mi>, bool)>,
+    follower_seq: u32,
     calls: Vec<CallStat>,
     closed: Option<(u64, u64)>,
     pub stats: SimStats,
@@ -301,12 +312,13 @@ impl Sim {
         let codes = program
             .procedures
             .iter()
-            .map(|p| lower(p).map(Rc::new))
+            .map(|p| lower(p, cfg.mode.implicit_sfu, cfg.mode.escrow).map(Rc::new))
             .collect::<Result<Vec<_>, _>>()?;
         let shards = (0..cfg.shards)
             .map(|i| {
                 let mut s = Shard::new(i, cfg.rule);
                 s.fault_ignore_read_ts = cfg.fault_ignore_read_ts;
+                s.checks = program.schema.tables.iter().filter(|t| !t.checks.is_empty()).map(|t| (t.id, t.checks.clone())).collect();
                 s
             })
             .collect();
@@ -331,6 +343,8 @@ impl Sim {
             history: History::default(),
             hist_index: HashMap::new(),
             early_patches: HashMap::new(),
+            followers: HashMap::new(),
+            follower_seq: 0,
             calls: vec![],
             closed: None,
             stats: SimStats::default(),
@@ -510,6 +524,7 @@ impl Sim {
         match e {
             Ep::Coord(n) => n,
             Ep::Shard(s) => s % self.nodes(),
+            Ep::Follower(_, n) => n,
         }
     }
 
@@ -538,7 +553,7 @@ impl Sim {
         let lat = self.net_latency(from, to);
         let repl = if after_repl { self.repl_delay() } else { 0 };
         let mut t = self.now + extra + repl + lat;
-        if matches!(to, Ep::Shard(_)) {
+        if matches!(to, Ep::Shard(_) | Ep::Follower(..)) {
             // Channels to shards are FIFO (statement order of a transaction).
             let last = self.chan_last.entry((from, to)).or_insert(0);
             if t <= *last {
@@ -576,6 +591,11 @@ impl Sim {
                 Event::Deliver { from, to, msg } => self.deliver(from, to, msg),
                 Event::ShardService(s) => self.service(s),
                 Event::Run(sid) => self.run(sid),
+                Event::FollowerService(s, n) => self.follower_service(s, n),
+                Event::FollowerRetry(s, n, mi) => {
+                    self.followers.entry((s, n)).or_default().0.push_back(mi);
+                    self.kick_follower(s, n);
+                }
                 Event::Client(c) => {
                     if let (Some((end, _)), Some(g)) = (self.closed, gen.as_mut()) {
                         if self.now < end {
@@ -589,12 +609,94 @@ impl Sim {
         }
     }
 
+    /// Closed timestamp: with follower reads on, no write commits at or below
+    /// `now - follower_read_lag`.
+    fn closed_ts(&self) -> Ts {
+        let lag = self.cfg.follower_read_lag_ns;
+        if !self.cfg.mode.follower_reads || self.now <= lag {
+            return Ts::default();
+        }
+        Ts { wall: self.now - lag, logical: u32::MAX, node: u16::MAX }
+    }
+
+    /// Nodes holding a replica of shard `s`: the leader's node then the next ones.
+    fn replica_nodes(&self, s: ShardId) -> Vec<NodeId> {
+        let n = self.nodes();
+        (0..self.cfg.replicas.min(n)).map(|k| (s + k) % n).collect()
+    }
+
+    /// Where a follower read of shard `s` from `node` goes: the replica on `node` if it
+    /// is a follower, else the first follower; None if the shard has no follower.
+    fn follower_for(&self, s: ShardId, node: NodeId) -> Option<NodeId> {
+        let r = self.replica_nodes(s);
+        let followers = &r[1..];
+        if followers.contains(&node) {
+            Some(node)
+        } else {
+            followers.first().copied()
+        }
+    }
+
+    fn kick_follower(&mut self, s: ShardId, n: NodeId) {
+        let q = self.followers.entry((s, n)).or_default();
+        if !q.1 && !q.0.is_empty() {
+            q.1 = true;
+            let now = self.now;
+            self.schedule(now, Event::FollowerService(s, n));
+        }
+    }
+
+    fn follower_service(&mut self, s: ShardId, n: NodeId) {
+        let Some(mi) = self.followers.get_mut(&(s, n)).and_then(|q| q.0.pop_front()) else {
+            if let Some(q) = self.followers.get_mut(&(s, n)) {
+                q.1 = false;
+            }
+            return;
+        };
+        self.stats.mis += 1;
+        self.stats.follower_reads += 1;
+        let res = self.shards[s].follower_read(&mi.op, mi.txn.read_ts, &self.g);
+        self.apply_patches(s);
+        self.kick(s);
+        let cost = match res {
+            None => {
+                // Blocked by a pending write at or below the read timestamp: retry.
+                let t = self.now + 20_000;
+                self.schedule(t, Event::FollowerRetry(s, n, mi));
+                self.cfg.cpu.mi_ns
+            }
+            Some((result, rows)) => {
+                let cost = self.cfg.cpu.mi_ns + rows as u64 * self.cfg.cpu.scan_row_ns;
+                let to = Ep::Coord(mi.txn.node);
+                self.send(
+                    Ep::Follower(s, n),
+                    to,
+                    Msg::C(ToCoord::MiResp {
+                        sid: mi.txn.sid,
+                        txn: mi.txn.id,
+                        seq: mi.seq,
+                        shard: s,
+                        result,
+                        push_above: None,
+                        durable: false,
+                    }),
+                    cost,
+                    false,
+                );
+                cost
+            }
+        };
+        let t = self.now + cost;
+        self.schedule(t, Event::FollowerService(s, n));
+    }
+
     fn service(&mut self, s: ShardId) {
         let Some(mi) = self.shards[s].next(&self.g) else {
             self.shards[s].busy = false;
             return;
         };
         self.stats.mis += 1;
+        self.shards[s].closed_ts = self.closed_ts();
         // Commit messages (stage, prepare, resolve, and a one-phase commit riding in
         // the writes' batch) are not charged shard CPU; only data MIs are.
         let commit_msg = matches!(mi.op, ShardOp::Commit1PC);
@@ -659,6 +761,13 @@ impl Sim {
     fn deliver(&mut self, from: Ep, to: Ep, msg: Msg) {
         match (to, msg) {
             (Ep::Shard(s), Msg::S(m)) => self.shard_msg(s, from, m),
+            (Ep::Follower(s, n), Msg::S(ToShard::Batch { txn, mis })) => {
+                let q = self.followers.entry((s, n)).or_default();
+                for (seq, op) in mis {
+                    q.0.push_back(Mi { txn: txn.clone(), seq, op });
+                }
+                self.kick_follower(s, n);
+            }
             (Ep::Coord(_), Msg::C(m)) => self.coord_msg(m),
             _ => unreachable!("misrouted message"),
         }
@@ -762,6 +871,47 @@ impl Sim {
         for (p, v) in code.params.iter().zip(&call.args) {
             vars[*p as usize] = Slot::S(v.clone());
         }
+        let mut node = node;
+        if self.cfg.mode.routing {
+            // Leaseholder routing: run the call on the node leading the most of its
+            // keys (counting statements whose key depends on the parameters only);
+            // ties keep the client's node, else the earliest key's node.
+            let mut votes: Vec<(NodeId, usize, usize)> = vec![]; // (node, count, first position)
+            // Scratch copy: assignments computed from parameters (e.g. a composite key)
+            // are evaluated so that later keys can vote too. A heuristic: no branches.
+            let mut scratch = vars.clone();
+            for (pos, ins) in code.ins.iter().enumerate() {
+                if let Ins::Assign { var, expr } = ins {
+                    if let Ok(v) = eval(expr, &VarsEnv { vars: &scratch, fwd: None }) {
+                        scratch[*var as usize] = Slot::S(v);
+                    }
+                    continue;
+                }
+                let Ins::Data(op) = ins else { continue };
+                let Ok(Prep::Remote(r)) = self.prepare(op, &VarsEnv { vars: &scratch, fwd: None }) else { continue };
+                if r.key.is_none() {
+                    continue;
+                }
+                let sh = r.parts[0].0;
+                // A read-only call served by followers goes where a follower replica is.
+                let n = match (self.cfg.mode.follower_reads && code.read_only).then(|| self.follower_for(sh, node)).flatten() {
+                    Some(f) => f,
+                    None => self.node_of(Ep::Shard(sh)),
+                };
+                match votes.iter_mut().find(|v| v.0 == n) {
+                    Some(v) => v.1 += 1,
+                    None => votes.push((n, 1, pos)),
+                }
+            }
+            if let Some(max) = votes.iter().map(|v| v.1).max() {
+                let best: Vec<&(NodeId, usize, usize)> = votes.iter().filter(|v| v.1 == max).collect();
+                if !best.iter().any(|v| v.0 == node) {
+                    let target = best.iter().min_by_key(|v| v.2).unwrap().0;
+                    self.stats.routed += 1;
+                    node = target;
+                }
+            }
+        }
         let st = ExecState {
             pc: 0,
             vars,
@@ -827,12 +977,20 @@ impl Sim {
         if s.att.is_some() {
             return;
         }
-        let read_ts = self.hlc_tick(s.node, None);
+        let mut read_ts = self.hlc_tick(s.node, None);
         let prio = *s.block_prio.get_or_insert(Priority { class: s.class, ts: read_ts });
+        let follower = self.cfg.mode.follower_reads && s.code.read_only && self.now > self.cfg.follower_read_lag_ns;
+        if follower {
+            // Unique timestamp at the closed time; writers are pushed above it.
+            self.follower_seq += 1;
+            read_ts = Ts { wall: self.now - self.cfg.follower_read_lag_ns, logical: (1 << 31) + self.follower_seq, node: s.node as u16 };
+        }
         let id = self.next_txn;
         self.next_txn += 1;
         self.g.begin(id, TxnState { status: Status::Running, prio, node: s.node, sid: s.sid, read_ts });
-        s.att = Some(Attempt::new(id, read_ts));
+        let mut a = Attempt::new(id, read_ts);
+        a.follower = follower;
+        s.att = Some(a);
     }
 
     fn flush(&mut self, s: &mut Session) {
@@ -848,9 +1006,14 @@ impl Sim {
             node: s.node,
             sid: s.sid,
         };
+        let follower = a.follower;
         let outbox = std::mem::take(&mut a.outbox);
         for (shard, mis) in outbox {
-            self.send(Ep::Coord(s.node), Ep::Shard(shard), Msg::S(ToShard::Batch { txn: meta.clone(), mis }), 0, false);
+            let to = match follower.then(|| self.follower_for(shard, s.node)).flatten() {
+                Some(n) => Ep::Follower(shard, n),
+                None => Ep::Shard(shard),
+            };
+            self.send(Ep::Coord(s.node), to, Msg::S(ToShard::Batch { txn: meta.clone(), mis }), 0, false);
         }
     }
 
@@ -1556,6 +1719,14 @@ impl Sim {
         }
         let a = s.att.as_mut().unwrap();
         let me = a.txn;
+        let has_reads = !a.spans.is_empty()
+            || a.ops.values().any(|x| {
+                !x.cancelled
+                    && matches!(
+                        s.code.ins[x.pc],
+                        Ins::Data(DataOp::Get { .. } | DataOp::Aggregate { .. } | DataOp::ScanOpen { .. })
+                    )
+            });
         let Some(o) = a.ops.get_mut(&seq) else { return false };
         if o.cancelled {
             return false;
@@ -1572,8 +1743,15 @@ impl Sim {
                 a.intent_shards.insert(shard);
                 o.applied = applied;
             }
+            MiResult::Err(CHECK_STALE) if has_reads => {
+                // The CHECK failed on data newer than our snapshot: our reads are stale,
+                // retry with a fresh snapshot (it will then fail or pass for real).
+                self.stats.restart_check += 1;
+                self.restart(s);
+                return false;
+            }
             MiResult::Err(c) => {
-                o.err = Some(c);
+                o.err = Some(if c == CHECK_STALE { errcode::CHECK_VIOLATION } else { c });
             }
             MiResult::Read { value, writer } => {
                 let key = o.key.unwrap();

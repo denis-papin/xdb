@@ -70,11 +70,31 @@ pub struct ExecMode {
     /// Commutative updates (escrow, O'Neil 1986): `UPDATE t SET c = c + x` places a
     /// delta that does not conflict with other deltas on the same row. Experiment.
     pub escrow: bool,
+    /// Implicit `SELECT ... FOR UPDATE`: a read of a row that the same block later
+    /// updates or deletes takes the write intent at once. Proven (CockroachDB).
+    pub implicit_sfu: bool,
+    /// Run each call on the node that leads the shard of its first key, instead of
+    /// the node the client picked. Proven (leaseholder routing).
+    pub routing: bool,
+    /// Read-only procedures read at a closed timestamp (`now - follower_read_lag`)
+    /// from a replica on the caller's node when there is one. Proven (Spanner stale
+    /// reads, CockroachDB follower reads).
+    pub follower_reads: bool,
 }
 
 impl ExecMode {
     const fn base(pipelining: bool, lookahead: bool, speculation: bool, parallel_commit: bool) -> Self {
-        ExecMode { pipelining, lookahead, speculation, parallel_commit, fast_path: false, escrow: false }
+        ExecMode {
+            pipelining,
+            lookahead,
+            speculation,
+            parallel_commit,
+            fast_path: false,
+            escrow: false,
+            implicit_sfu: false,
+            routing: false,
+            follower_reads: false,
+        }
     }
     /// One statement at a time, classic 2PC.
     pub fn naive() -> Self {
@@ -100,26 +120,48 @@ impl ExecMode {
         self.escrow = true;
         self
     }
-    pub fn name(&self) -> &'static str {
+    pub fn with_sfu(mut self) -> Self {
+        self.implicit_sfu = true;
+        self
+    }
+    pub fn with_routing(mut self) -> Self {
+        self.routing = true;
+        self
+    }
+    pub fn with_follower_reads(mut self) -> Self {
+        self.follower_reads = true;
+        self
+    }
+    /// The best mode of the previous study: speculative + 1PC + escrow.
+    pub fn best() -> Self {
+        Self::speculative().with_fast_path().with_escrow()
+    }
+    pub fn name(&self) -> String {
         let base = match (self.pipelining, self.lookahead, self.speculation, self.parallel_commit) {
-            (false, false, false, false) => 0,
-            (true, false, false, true) => 1,
-            (true, true, false, true) => 2,
-            (true, true, true, true) => 3,
-            _ => return "custom",
+            (false, false, false, false) => "naive",
+            (true, false, false, true) => "v1",
+            (true, true, false, true) => "parallel",
+            (true, true, true, true) => "speculative",
+            _ => "custom",
         };
-        const NAMES: [[&str; 4]; 4] = [
-            ["naive", "naive+1pc", "naive+escrow", "naive+1pc+escrow"],
-            ["v1", "v1+1pc", "v1+escrow", "v1+1pc+escrow"],
-            ["parallel", "parallel+1pc", "parallel+escrow", "parallel+1pc+escrow"],
-            ["speculative", "speculative+1pc", "speculative+escrow", "speculative+1pc+escrow"],
-        ];
-        NAMES[base][self.fast_path as usize + 2 * self.escrow as usize]
+        let mut s = base.to_string();
+        for (on, tag) in [
+            (self.fast_path, "+1pc"),
+            (self.escrow, "+escrow"),
+            (self.implicit_sfu, "+sfu"),
+            (self.routing, "+route"),
+            (self.follower_reads, "+follower"),
+        ] {
+            if on {
+                s.push_str(tag);
+            }
+        }
+        s
     }
     pub fn all() -> [ExecMode; 4] {
         [Self::naive(), Self::v1(), Self::parallel(), Self::speculative()]
     }
-    /// Base modes plus the improvements of the "road to product" study.
+    /// Base modes plus every improvement studied after the first POC.
     pub fn extended() -> Vec<ExecMode> {
         let mut v: Vec<ExecMode> = Self::all().to_vec();
         for m in [Self::v1(), Self::speculative()] {
@@ -127,6 +169,10 @@ impl ExecMode {
             v.push(m.with_escrow());
             v.push(m.with_fast_path().with_escrow());
         }
+        v.push(Self::v1().with_sfu());
+        v.push(Self::v1().with_routing());
+        v.push(Self::v1().with_follower_reads());
+        v.push(Self::best().with_sfu().with_routing().with_follower_reads());
         v
     }
 }
@@ -161,6 +207,9 @@ pub struct ClusterConfig {
     /// abort; doubles with each restart of the same block (capped at x64).
     /// Without it, wait-die livelocks (older restarted MIs starve a younger holder).
     pub restart_backoff_ns: u64,
+    /// Follower reads use timestamp `now - follower_read_lag_ns`; writes are pushed
+    /// above it (the closed timestamp).
+    pub follower_read_lag_ns: u64,
     /// Fault injection for testing the tests: writes ignore the read-timestamp cache
     /// (breaks serializability on purpose). Never set outside tests.
     #[doc(hidden)]
@@ -181,6 +230,7 @@ impl Default for ClusterConfig {
             default_range: (0, 1_000_000),
             lookahead_window: 64,
             restart_backoff_ns: 20_000,
+            follower_read_lag_ns: 2_000_000,
             fault_ignore_read_ts: false,
         }
     }

@@ -11,7 +11,7 @@ use crate::eval::{eval, RowEnv};
 use crate::types::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
-use xdb_ir::{errcode, ColId, Expr, Key, Row, TableId, Ts, TxnId, Value};
+use xdb_ir::{errcode, ColCheck, ColId, Expr, Key, Row, TableId, Ts, TxnId, Value};
 
 pub type Delta = Vec<(ColId, i64)>;
 
@@ -121,6 +121,8 @@ pub struct ShardStats {
     pub deltas: u64,
     pub one_pc_ok: u64,
     pub one_pc_fail: u64,
+    pub escrow_fail: u64,
+    pub escrow_wait: u64,
 }
 
 pub struct Done {
@@ -155,6 +157,12 @@ enum Mode {
     Delta,
 }
 
+enum Esc {
+    Ok,
+    Fail,
+    Wait(Vec<(TxnId, Ts, Priority)>),
+}
+
 enum Act {
     Retry,
     Skip,
@@ -184,6 +192,10 @@ pub struct Shard {
     pub stats: ShardStats,
     rule: ConflictRule,
     pub fault_ignore_read_ts: bool,
+    /// Closed timestamp: no new write may commit at or below it (follower reads).
+    pub closed_ts: Ts,
+    /// CHECK bounds per table (from the schema).
+    pub checks: HashMap<TableId, Vec<ColCheck>>,
 }
 
 impl Shard {
@@ -205,6 +217,8 @@ impl Shard {
             stats: ShardStats::default(),
             rule,
             fault_ignore_read_ts: false,
+            closed_ts: Ts { wall: 0, logical: 0, node: 0 },
+            checks: HashMap::new(),
         }
     }
 
@@ -560,6 +574,9 @@ impl Shard {
             }
         };
         let mut push: Option<Ts> = None;
+        if !own && self.closed_ts.wall > 0 && me.write_ts <= self.closed_ts {
+            push = Some(self.closed_ts);
+        }
         if !own {
             if let Some(lt) = latest_ts {
                 if lt >= me.write_ts {
@@ -595,6 +612,11 @@ impl Shard {
                 }
             },
         };
+        if applied && self.violates(key.table, &new) {
+            let stale = !own && latest_ts.map_or(false, |t| t > me.read_ts);
+            let code = if stale { CHECK_STALE } else { errcode::CHECK_VIOLATION };
+            return Step::Done(MiResult::Err(code), None, false, 1);
+        }
         let its = match push {
             Some(p) => me.write_ts.max(bumped(p)),
             None => me.write_ts,
@@ -614,6 +636,71 @@ impl Shard {
         Step::Done(result, push, true, 1)
     }
 
+    /// A row value breaks a CHECK bound of its table.
+    fn violates(&self, table: TableId, row: &Option<Row>) -> bool {
+        let (Some(checks), Some(row)) = (self.checks.get(&table), row) else { return false };
+        checks.iter().any(|k| match row.get(k.col as usize) {
+            Some(Value::Int(v)) => k.min.map_or(false, |m| *v < m) || k.max.map_or(false, |m| *v > m),
+            _ => false,
+        })
+    }
+
+    /// O'Neil escrow test for a new delta of `me` on `key`. With `inf`/`sup` the value
+    /// if every pending negative / positive delta commits and no other does, the
+    /// invariant kept is `min <= inf` and `sup <= max`, so any subset of pending
+    /// deltas may commit, in any order. Returns:
+    /// - `Ok`: accept;
+    /// - `Fail`: the bound breaks even in the best case (CHECK violation);
+    /// - `Wait(h)`: it depends on the outcome of the pending deltas `h`.
+    fn escrow_check(&self, key: Key, me: TxnId, adds: &Delta) -> Esc {
+        let Some(checks) = self.checks.get(&key.table) else { return Esc::Ok };
+        let Some(rec) = self.data.get(&key) else { return Esc::Ok };
+        let base_row = rec.versions.last().and_then(|v| v.value.as_ref());
+        let mut wait: Vec<(TxnId, Ts, Priority)> = vec![];
+        for k in checks {
+            let d: i64 = adds.iter().filter(|(c, _)| *c == k.col).map(|x| x.1).sum();
+            if d == 0 {
+                continue;
+            }
+            let Some(Value::Int(base)) = base_row.and_then(|r| r.get(k.col as usize)) else { continue };
+            let mut own = d;
+            let (mut neg, mut pos) = (0i64, 0i64);
+            let mut holders = vec![];
+            for dl in &rec.deltas {
+                let t: i64 = dl.stack.iter().flat_map(|(_, x)| x.iter()).filter(|(c, _)| *c == k.col).map(|x| x.1).sum();
+                if dl.txn == me {
+                    own = own.saturating_add(t);
+                } else {
+                    neg = neg.saturating_add(t.min(0));
+                    pos = pos.saturating_add(t.max(0));
+                    holders.push((dl.txn, dl.ts, dl.prio, t));
+                }
+            }
+            if let Some(m) = k.min {
+                if base.saturating_add(pos).saturating_add(own) < m {
+                    return Esc::Fail;
+                }
+                if base.saturating_add(neg).saturating_add(own.min(0)) < m {
+                    // Depends on pending debits aborting or pending credits committing.
+                    wait.extend(holders.iter().filter(|h| h.3 != 0).map(|h| (h.0, h.1, h.2)));
+                }
+            }
+            if let Some(m) = k.max {
+                if base.saturating_add(neg).saturating_add(own) > m {
+                    return Esc::Fail;
+                }
+                if base.saturating_add(pos).saturating_add(own.max(0)) > m {
+                    wait.extend(holders.iter().filter(|h| h.3 != 0).map(|h| (h.0, h.1, h.2)));
+                }
+            }
+        }
+        if wait.is_empty() {
+            Esc::Ok
+        } else {
+            Esc::Wait(wait)
+        }
+    }
+
     /// Escrow: add `adds` to integer columns without reading the row.
     fn delta(&mut self, mi: &Mi, key: Key, adds: &Delta, g: &mut Global, out: &mut Vec<Out>) -> Step {
         let me = mi.txn.clone();
@@ -623,11 +710,21 @@ impl Shard {
             Conf::Go => {}
         }
         let other_read = self.max_other_read(key, me.id);
-        let rec = self.data.entry(key).or_default();
-        if let Some(i) = rec.intent.as_mut().filter(|i| i.txn == me.id) {
+        let own_top = self
+            .data
+            .entry(key)
+            .or_default()
+            .intent
+            .as_ref()
+            .filter(|i| i.txn == me.id)
+            .map(|i| i.stack.last().unwrap().1.clone());
+        if let Some(top) = own_top {
             // Already a normal writer of this row: just update the provisional value.
-            let top = i.stack.last().unwrap().1.clone();
             let new = apply_delta(&top, adds);
+            if self.violates(key.table, &new) {
+                return Step::Done(MiResult::Err(errcode::CHECK_VIOLATION), None, false, 1);
+            }
+            let i = self.data.get_mut(&key).unwrap().intent.as_mut().unwrap();
             i.stack.push((mi.seq, new.clone()));
             return Step::Done(
                 MiResult::Write { new_value: new, applied: top.is_some(), prev: top, prev_writer: Some(me.id) },
@@ -636,6 +733,37 @@ impl Shard {
                 1,
             );
         }
+        // O'Neil escrow: accept only if the CHECK bounds hold in the worst case.
+        loop {
+            match self.escrow_check(key, me.id, adds) {
+                Esc::Ok => break,
+                Esc::Fail => {
+                    self.stats.escrow_fail += 1;
+                    let stale = self.data[&key].versions.last().map_or(false, |v| v.ts > me.read_ts);
+                    let code = if stale { CHECK_STALE } else { errcode::CHECK_VIOLATION };
+                    return Step::Done(MiResult::Err(code), None, false, 1);
+                }
+                Esc::Wait(hs) => {
+                    self.stats.escrow_wait += 1;
+                    let mut retry = false;
+                    for (h, its, hp) in hs {
+                        match self.decide(key, h, its, hp, &me, true, g, out) {
+                            Act::Retry => {
+                                retry = true;
+                                break;
+                            }
+                            Act::Park => return Step::Park(key),
+                            Act::Die => return self.die(&me, g),
+                            Act::Skip => {}
+                        }
+                    }
+                    if !retry {
+                        return Step::Park(key);
+                    }
+                }
+            }
+        }
+        let rec = self.data.entry(key).or_default();
         let own_delta = rec.deltas.iter().any(|d| d.txn == me.id);
         let latest = rec.versions.last().map(|v| (v.ts, v.value.is_some()));
         if !own_delta && !latest.map_or(false, |l| l.1) {
@@ -643,10 +771,13 @@ impl Shard {
             return self.write_like(mi, key, WK::Update(&vec![]), g, out);
         }
         let mut push: Option<Ts> = None;
+        if !own_delta && self.closed_ts.wall > 0 && me.write_ts <= self.closed_ts {
+            push = Some(self.closed_ts);
+        }
         if !own_delta {
             if let Some((lt, _)) = latest {
                 if lt >= me.write_ts {
-                    push = Some(lt);
+                    push = push.max(Some(lt));
                 }
             }
             if let Some(rt) = other_read {
@@ -771,6 +902,89 @@ impl Shard {
             self.bump_range(table, lo, hi_eff, me.read_ts, me.id, g);
         }
         Step::Done(MiResult::Scan { rows, seen, hi_eff }, push, wrote, n)
+    }
+
+    // ---------------------------------------------------------------- follower reads
+
+    /// A pending write of another transaction at or below `ts` blocks a follower read
+    /// (committed / aborted ones are cleaned up on the way).
+    fn follower_blocked(&mut self, key: Key, ts: Ts, g: &Global) -> bool {
+        'outer: loop {
+            let Some(rec) = self.data.get(&key) else { return false };
+            let pending: Vec<(TxnId, Ts)> =
+                rec.intent.iter().map(|i| (i.txn, i.ts)).chain(rec.deltas.iter().map(|d| (d.txn, d.ts))).collect();
+            for (h, its) in pending {
+                match g.status(h) {
+                    Status::Committed(c) => {
+                        self.resolve_key(key, h, c);
+                        continue 'outer;
+                    }
+                    Status::Aborted => {
+                        self.drop_intent(key, h);
+                        continue 'outer;
+                    }
+                    _ => {
+                        if its <= ts {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
+    /// Serve a read on a follower replica at closed timestamp `ts` (no read-timestamp
+    /// cache update: writes can no longer commit at or below `ts`). Returns None when
+    /// a pending write blocks it (the caller retries), else the result and rows read.
+    pub fn follower_read(&mut self, op: &ShardOp, ts: Ts, g: &Global) -> Option<(MiResult, usize)> {
+        match op {
+            ShardOp::Get { key, for_update: false } => {
+                if self.follower_blocked(*key, ts, g) {
+                    return None;
+                }
+                let (value, writer) =
+                    self.data.get(key).and_then(|r| r.at(ts)).map(|v| (v.value.clone(), v.writer)).unwrap_or((None, None));
+                Some((MiResult::Read { value, writer }, 1))
+            }
+            ShardOp::Scan { table, lo, hi, filter, limit, for_update: false } => {
+                let keys: Vec<Key> = if lo > hi {
+                    vec![]
+                } else {
+                    self.data.range(Key { table: *table, pk: *lo }..=Key { table: *table, pk: *hi }).map(|(k, _)| *k).collect()
+                };
+                for k in &keys {
+                    if self.follower_blocked(*k, ts, g) {
+                        return None;
+                    }
+                }
+                let (mut rows, mut seen, mut hi_eff) = (vec![], vec![], *hi);
+                for k in &keys {
+                    let Some(v) = self.data[k].at(ts) else { continue };
+                    let Some(row) = v.value.clone() else { continue };
+                    seen.push((k.pk, v.writer));
+                    let pass = match filter {
+                        None => true,
+                        Some(f) => match eval(f, &RowEnv { row: &row }) {
+                            Ok(x) => x.is_true(),
+                            Err(code) => return Some((MiResult::Err(code), keys.len())),
+                        },
+                    };
+                    if pass {
+                        rows.push(row);
+                        if limit.map_or(false, |l| rows.len() as u64 >= l) {
+                            hi_eff = k.pk;
+                            break;
+                        }
+                    }
+                }
+                if *limit == Some(0) {
+                    hi_eff = lo.saturating_sub(1);
+                }
+                Some((MiResult::Scan { rows, seen, hi_eff }, keys.len()))
+            }
+            _ => Some((MiResult::Err(errcode::VALUE_ERROR), 0)),
+        }
     }
 
     // ---------------------------------------------------------------- txn messages

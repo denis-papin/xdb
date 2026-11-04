@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use xdb_ir::{
-    errcode, AggFunc, BinOp, ColId, ColType, ColumnDef, Expr, Handler, PkRange, Procedure, Program,
+    errcode, AggFunc, BinOp, ColCheck, ColId, ColType, ColumnDef, Expr, Handler, PkRange, Procedure, Program,
     Schema, SequenceDef, Stmt, TableDef, TableId, UnOp, Value, VarDecl, VarId, VarType,
 };
 
@@ -342,6 +342,8 @@ impl Parser {
         self.expect(Tok::LParen)?;
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut pk: Option<ColId> = None;
+        // (column name, position, min, max) — resolved after all columns are known.
+        let mut checks: Vec<(String, (u32, u32), Option<i64>, Option<i64>)> = Vec::new();
         let check_pk = |p: &Parser, ty: ColType, pos| {
             if ty != ColType::Number {
                 Err(p.err_at(pos, "the PRIMARY KEY column must be NUMBER or INTEGER"))
@@ -351,7 +353,10 @@ impl Parser {
         };
         loop {
             let cpos = self.here();
-            if self.eat_kw("primary") {
+            if self.eat_kw("check") {
+                // table-level CHECK (col op n)
+                checks.push(self.check_clause()?);
+            } else if self.eat_kw("primary") {
                 // table-level PRIMARY KEY (col)
                 self.expect_kw("key")?;
                 self.expect(Tok::LParen)?;
@@ -382,6 +387,12 @@ impl Parser {
                         }
                         check_pk(self, ty, kpos)?;
                         pk = Some(columns.len() as ColId);
+                    } else if self.eat_kw("check") {
+                        let c = self.check_clause()?;
+                        if c.0 != cname {
+                            return Err(self.err_at(c.1, "a column CHECK must constrain its own column"));
+                        }
+                        checks.push(c);
                     } else if self.eat_kw("not") {
                         self.expect_kw("null")?;
                     } else if self.eat_kw("null") {
@@ -402,9 +413,57 @@ impl Parser {
         }
         let pk_col = pk.ok_or_else(|| self.err_at(pos, format!("table '{name}' needs exactly one PRIMARY KEY column")))?;
         self.semi()?;
+        let mut col_checks: Vec<ColCheck> = Vec::new();
+        for (c, cpos, min, max) in checks {
+            let idx = columns
+                .iter()
+                .position(|d| d.name == c)
+                .ok_or_else(|| self.err_at(cpos, format!("unknown column '{c}' in CHECK")))?;
+            if columns[idx].ty != ColType::Number {
+                return Err(self.err_at(cpos, "CHECK bounds are only supported on NUMBER columns"));
+            }
+            match col_checks.iter_mut().find(|k| k.col == idx as ColId) {
+                Some(k) => {
+                    k.min = k.min.max(min);
+                    k.max = match (k.max, max) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
+                None => col_checks.push(ColCheck { col: idx as ColId, min, max }),
+            }
+        }
         let id = self.schema.tables.len() as TableId;
-        self.schema.tables.push(TableDef { id, name, columns, pk_col });
+        self.schema.tables.push(TableDef { id, name, columns, pk_col, checks: col_checks });
         Ok(())
+    }
+
+    /// `( col >= n )`, `>`, `<=`, `<` with an integer literal (bounds only).
+    fn check_clause(&mut self) -> Res<(String, (u32, u32), Option<i64>, Option<i64>)> {
+        self.expect(Tok::LParen)?;
+        let cpos = self.here();
+        let c = self.ident("a column name")?;
+        let op = self.advance().tok;
+        let neg = self.eat(&Tok::Minus);
+        let n = match self.advance().tok {
+            Tok::Int(i) => {
+                if neg {
+                    -i
+                } else {
+                    i
+                }
+            }
+            _ => return Err(self.err_at(cpos, "CHECK supports only `column >=, >, <= or < integer`")),
+        };
+        self.expect(Tok::RParen)?;
+        let (min, max) = match op {
+            Tok::Ge => (Some(n), None),
+            Tok::Gt => (Some(n + 1), None),
+            Tok::Le => (None, Some(n)),
+            Tok::Lt => (None, Some(n - 1)),
+            _ => return Err(self.err_at(cpos, "CHECK supports only `column >=, >, <= or < integer`")),
+        };
+        Ok((c, cpos, min, max))
     }
 
     fn create_sequence(&mut self) -> Res<()> {
