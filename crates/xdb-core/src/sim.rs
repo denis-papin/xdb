@@ -66,6 +66,9 @@ pub struct SimStats {
     pub mis: u64,
     pub lookahead_issued: u64,
     pub refreshes: u64,
+    pub one_pc: u64,
+    pub one_pc_fallback: u64,
+    pub deltas_issued: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +171,7 @@ struct Op {
     rows: Vec<Row>,
     dur_expected: usize,
     dur_got: usize,
+    part_shards: Vec<ShardId>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -177,6 +181,8 @@ enum Phase {
     Stage { staged: bool },
     Prepare { pending: usize, ok: bool },
     Record { done: bool },
+    /// A one-phase commit was sent with the last writes.
+    OnePc,
 }
 
 struct Attempt {
@@ -196,6 +202,7 @@ struct Attempt {
     outbox: BTreeMap<ShardId, Vec<(u32, ShardOp)>>,
     phase: Phase,
     deferred_err: Option<(i32, String)>,
+    tried_1pc: bool,
 }
 
 impl Attempt {
@@ -217,6 +224,7 @@ impl Attempt {
             outbox: BTreeMap::new(),
             phase: Phase::None,
             deferred_err: None,
+            tried_1pc: false,
         }
     }
     fn outstanding(&self) -> usize {
@@ -277,6 +285,8 @@ pub struct Sim {
     next_txn: TxnId,
     seq_state: HashMap<(NodeId, SeqId), u64>,
     history: History,
+    hist_index: HashMap<TxnId, usize>,
+    early_patches: HashMap<TxnId, Vec<(Key, Option<Row>)>>,
     calls: Vec<CallStat>,
     closed: Option<(u64, u64)>,
     pub stats: SimStats,
@@ -319,6 +329,8 @@ impl Sim {
             next_txn: 1,
             seq_state: HashMap::new(),
             history: History::default(),
+            hist_index: HashMap::new(),
+            early_patches: HashMap::new(),
             calls: vec![],
             closed: None,
             stats: SimStats::default(),
@@ -583,14 +595,18 @@ impl Sim {
             return;
         };
         self.stats.mis += 1;
+        // Commit messages (stage, prepare, resolve, and a one-phase commit riding in
+        // the writes' batch) are not charged shard CPU; only data MIs are.
+        let commit_msg = matches!(mi.op, ShardOp::Commit1PC);
         let mut out = vec![];
         let done = self.shards[s].process(mi, &mut self.g, &mut out);
         let rows = done.as_ref().map_or(0, |d| d.rows);
-        let cost = self.cfg.cpu.mi_ns + rows as u64 * self.cfg.cpu.scan_row_ns;
+        let cost = if commit_msg { 0 } else { self.cfg.cpu.mi_ns + rows as u64 * self.cfg.cpu.scan_row_ns };
         for o in out {
             self.send(Ep::Shard(s), o.to, o.msg, o.extra_ns, o.after_replication);
         }
-        if let Some(d) = done {
+        self.apply_patches(s);
+        if let Some(d) = done.filter(|d| !d.silent) {
             let durable = d.wrote && self.cfg.mode.parallel_commit;
             let to = Ep::Coord(d.txn.node);
             self.send(
@@ -620,6 +636,24 @@ impl Sim {
         }
         let t = self.now + cost;
         self.schedule(t, Event::ShardService(s));
+    }
+
+    /// Final values of delta (escrow) writes are known only when the shard applies
+    /// them: copy them into the history record of their transaction.
+    fn apply_patches(&mut self, s: ShardId) {
+        if self.shards[s].patches.is_empty() {
+            return;
+        }
+        for (txn, key, value) in std::mem::take(&mut self.shards[s].patches) {
+            let Some(&i) = self.hist_index.get(&txn) else {
+                // One-phase commit: the shard applied it before the coordinator heard.
+                self.early_patches.entry(txn).or_default().push((key, value));
+                continue;
+            };
+            if let Some(w) = self.history.txns[i].writes.iter_mut().find(|w| w.key == key) {
+                w.value = value;
+            }
+        }
     }
 
     fn deliver(&mut self, from: Ep, to: Ep, msg: Msg) {
@@ -656,7 +690,13 @@ impl Sim {
             ToShard::Resolve { txn, commit_ts } => self.shards[s].resolve(txn, commit_ts),
             ToShard::Abort { txn } => self.shards[s].abort(txn),
             ToShard::RollbackTo { txn, from_seq, to_seq } => self.shards[s].rollback_to(txn, from_seq, to_seq),
+            ToShard::Finish1PC { txn, ts, sid, node } => {
+                self.g.set(txn, Status::Committed(ts));
+                self.shards[s].resolve(txn, ts);
+                self.send(me, Ep::Coord(node), Msg::C(ToCoord::OnePcResp { sid, txn, ts }), 0, false);
+            }
         }
+        self.apply_patches(s);
         self.kick(s);
     }
 
@@ -1171,7 +1211,10 @@ impl Sim {
                         .iter()
                         .map(|(c, e)| Ok((*c, subst(e, env, None)?)))
                         .collect::<Result<Vec<_>, i32>>()?;
-                    one(k, ShardOp::Update { key: k, sets }, false)
+                    match self.cfg.mode.escrow.then(|| as_delta(&sets)).flatten() {
+                        Some(adds) => one(k, ShardOp::Delta { key: k, adds }, false),
+                        None => one(k, ShardOp::Update { key: k, sets }, false),
+                    }
                 }
             },
             DataOp::Delete { table, key, .. } => match self.eval_key(*table, key, env)? {
@@ -1397,7 +1440,8 @@ impl Sim {
             | ToCoord::StageResp { sid, .. }
             | ToCoord::PrepareResp { sid, .. }
             | ToCoord::CommitRecordResp { sid, .. }
-            | ToCoord::Wounded { sid, .. } => *sid,
+            | ToCoord::Wounded { sid, .. }
+            | ToCoord::OnePcResp { sid, .. } => *sid,
         };
         let Some(mut s) = self.sessions.get_mut(sid).and_then(|x| x.take()) else { return };
         let txn = match &m {
@@ -1407,7 +1451,8 @@ impl Sim {
             | ToCoord::StageResp { txn, .. }
             | ToCoord::PrepareResp { txn, .. }
             | ToCoord::CommitRecordResp { txn, .. }
-            | ToCoord::Wounded { txn, .. } => *txn,
+            | ToCoord::Wounded { txn, .. }
+            | ToCoord::OnePcResp { txn, .. } => *txn,
         };
         if s.att.as_ref().map(|a| a.txn) != Some(txn) {
             self.sessions[sid] = Some(s);
@@ -1451,9 +1496,13 @@ impl Sim {
             ToCoord::CommitRecordResp { .. } => {
                 s.att.as_mut().unwrap().phase = Phase::Record { done: true };
             }
+            ToCoord::OnePcResp { ts, .. } => {
+                self.stats.one_pc += 1;
+                self.finalize(&mut s, ts);
+            }
             ToCoord::Wounded { .. } => {
                 let st = s.att.as_ref().map(|a| &a.phase);
-                if matches!(st, Some(Phase::None) | Some(Phase::Refresh { .. })) {
+                if matches!(st, Some(Phase::None) | Some(Phase::Refresh { .. }) | Some(Phase::OnePc)) {
                     self.stats.restart_wounded += 1;
                     self.restart(&mut s);
                 }
@@ -1482,6 +1531,17 @@ impl Sim {
             self.restart(s);
             return false;
         }
+        if let MiResult::OnePc { ok } = result {
+            // The one-phase commit could not apply (pushed, or a write failed):
+            // fall back to the normal commit path; the intents are in place.
+            debug_assert!(!ok);
+            let a = s.att.as_mut().unwrap();
+            if a.phase == Phase::OnePc {
+                a.phase = Phase::None;
+            }
+            self.stats.one_pc_fallback += 1;
+            return s.wait == Wait::Commit;
+        }
         let node = s.node;
         let new_ts = {
             let a = s.att.as_ref().unwrap();
@@ -1504,7 +1564,14 @@ impl Sim {
             o.dur_expected += 1;
         }
         match result {
-            MiResult::Aborted => unreachable!(),
+            MiResult::Aborted | MiResult::OnePc { .. } => unreachable!(),
+            MiResult::Delta { applied } => {
+                // Final value known only at commit: patched into the history then.
+                self.stats.deltas_issued += 1;
+                a.wlog.push((seq, o.key.unwrap(), None));
+                a.intent_shards.insert(shard);
+                o.applied = applied;
+            }
             MiResult::Err(c) => {
                 o.err = Some(c);
             }
@@ -1569,7 +1636,8 @@ impl Sim {
                     let table = o.table;
                     let lo = o.lo;
                     a.range_reads.push((seq, RangeReadEvent { table, lo, hi: hi_eff, rows: seen }));
-                    for sh in a.shards.clone() {
+                    let shards = if self.cfg.mode.fast_path { o.part_shards.clone() } else { a.shards.iter().copied().collect() };
+                    for sh in shards {
                         a.spans.push((sh, Span::Range(table, lo, hi_eff)));
                     }
                 }
@@ -1597,7 +1665,18 @@ impl Sim {
         loop {
             let a = s.att.as_mut().unwrap();
             match &a.phase {
+                Phase::OnePc => return false,
                 Phase::None => {
+                    if self.cfg.mode.fast_path && !a.tried_1pc {
+                        a.tried_1pc = true;
+                        if let Some(sh) = one_pc_shard(a) {
+                            let seq = a.next_seq;
+                            a.next_seq += 1;
+                            a.outbox.get_mut(&sh).unwrap().push((seq, ShardOp::Commit1PC));
+                            a.phase = Phase::OnePc;
+                            return false;
+                        }
+                    }
                     if a.outstanding() > 0 {
                         return false;
                     }
@@ -1726,6 +1805,15 @@ impl Sim {
             range_reads: a.range_reads.into_iter().map(|x| x.1).collect(),
             writes: last.into_iter().map(|(key, (_, value))| WriteEvent { key, value }).collect(),
         });
+        self.hist_index.insert(a.txn, self.history.txns.len() - 1);
+        if let Some(p) = self.early_patches.remove(&a.txn) {
+            let rec = self.history.txns.last_mut().unwrap();
+            for (key, value) in p {
+                if let Some(w) = rec.writes.iter_mut().find(|w| w.key == key) {
+                    w.value = value;
+                }
+            }
+        }
         for sh in a.shards {
             self.send(Ep::Coord(s.node), Ep::Shard(sh), Msg::S(ToShard::Resolve { txn: a.txn, commit_ts: ts }), 0, false);
         }
@@ -1745,6 +1833,45 @@ impl Sim {
         s.st.pc += 1;
         s.snap = s.st.clone();
     }
+}
+
+/// Escrow: an UPDATE whose every assignment is `c = c + k` / `c = c - k` / `c = k + c`
+/// with a known integer `k` becomes a commutative delta.
+fn as_delta(sets: &[(ColId, Expr)]) -> Option<Vec<(ColId, i64)>> {
+    sets.iter()
+        .map(|(c, e)| match e {
+            Expr::Binary(op, a, b) => match (op, a.as_ref(), b.as_ref()) {
+                (BinOp::Add, Expr::OldCol(x), Expr::Const(Value::Int(k)))
+                | (BinOp::Add, Expr::Const(Value::Int(k)), Expr::OldCol(x))
+                    if x == c =>
+                {
+                    Some((*c, *k))
+                }
+                (BinOp::Sub, Expr::OldCol(x), Expr::Const(Value::Int(k))) if x == c => k.checked_neg().map(|n| (*c, n)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The shard for a one-phase commit, if every write still pending is unsent and goes
+/// to one shard that also holds every earlier intent, and nothing pushed the
+/// transaction (no refresh needed).
+fn one_pc_shard(a: &Attempt) -> Option<ShardId> {
+    if a.write_ts != a.read_ts || a.deferred_err.is_some() || a.outbox.len() != 1 {
+        return None;
+    }
+    let (&sh, unsent) = a.outbox.iter().next().unwrap();
+    if a.intent_shards.iter().any(|s| *s != sh) {
+        return None;
+    }
+    let unsent: HashSet<u32> = unsent.iter().map(|(q, _)| *q).collect();
+    let all_writes = a.outbox[&sh].iter().all(|(_, op)| {
+        matches!(op, ShardOp::Update { .. } | ShardOp::Insert { .. } | ShardOp::Delete { .. } | ShardOp::Delta { .. })
+    });
+    let pending_unsent = a.ops.iter().filter(|(_, o)| !o.ready && !o.cancelled).all(|(q, _)| unsent.contains(q));
+    (all_writes && pending_unsent).then_some(sh)
 }
 
 fn issue(a: &mut Attempt, pc: usize, r: Remote) -> u32 {
@@ -1772,6 +1899,7 @@ fn issue(a: &mut Attempt, pc: usize, r: Remote) -> u32 {
             rows: vec![],
             dur_expected: 0,
             dur_got: 0,
+            part_shards: r.parts.iter().map(|p| p.0).collect(),
         },
     );
     for (sh, op) in r.parts {

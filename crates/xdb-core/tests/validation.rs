@@ -82,7 +82,7 @@ fn transfer_latency_by_mode() {
 
 #[test]
 fn insufficient_funds_undoes_speculative_writes() {
-    for mode in ExecMode::all() {
+    for mode in ExecMode::extended() {
         let mut sim = bank(mode, ConflictRule::WoundWait, 3, N_ACC, 2);
         let st = sim.call(0, Call::new("transfer", &[10, 150, START_BAL + 1]));
         assert_eq!(st.result.as_ref().unwrap_err().0, -20001, "{}", mode.name());
@@ -95,7 +95,7 @@ fn insufficient_funds_undoes_speculative_writes() {
 #[test]
 fn transfer_to_self_keeps_balance() {
     // The same-key bug of the first design draft (§3.4).
-    for mode in ExecMode::all() {
+    for mode in ExecMode::extended() {
         let mut sim = bank(mode, ConflictRule::WoundWait, 3, N_ACC, 3);
         let st = sim.call(1, Call::new("transfer", &[42, 42, 100]));
         assert!(st.result.is_ok());
@@ -140,7 +140,7 @@ fn run_bank(mode: ExecMode, rule: ConflictRule, shards: usize, n_acc: i64, clien
 #[test]
 fn concurrent_bank_is_serializable_all_modes() {
     for rule in [ConflictRule::WoundWait, ConflictRule::WaitDie] {
-        for mode in ExecMode::all() {
+        for mode in ExecMode::extended() {
             for shards in [1, 3, 5] {
                 let label = format!("{}/{:?}/{} shards", mode.name(), rule, shards);
                 let (sim, rep) = run_bank(mode, rule, shards, 100, 48, 11);
@@ -200,7 +200,7 @@ BEGIN
 END mv;
 /\n";
     let p = xdb_compiler::compile(&src).unwrap();
-    for mode in ExecMode::all() {
+    for mode in ExecMode::extended() {
         let cfg = ClusterConfig {
             shards: 3,
             mode,
@@ -250,7 +250,7 @@ BEGIN
 END p;
 /";
     let p = xdb_compiler::compile(src).unwrap();
-    for mode in ExecMode::all() {
+    for mode in ExecMode::extended() {
         let cfg = ClusterConfig { shards: 3, mode, table_ranges: vec![(0, 0, 30)], ..Default::default() };
         let mut sim = Sim::new(p.clone(), cfg).unwrap();
         sim.load((1..=3).map(|i| (Key { table: 0, pk: i }, vec![Value::Int(i), Value::Int(0)])));
@@ -280,7 +280,7 @@ fn tpcc_lite_serializable_and_consistent() {
     const W: i64 = 2;
     const C: i64 = 30;
     const I: i64 = 100;
-    for mode in ExecMode::all() {
+    for mode in ExecMode::extended() {
         let cfg = ClusterConfig {
             shards: 3,
             mode,

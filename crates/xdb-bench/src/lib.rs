@@ -287,6 +287,8 @@ pub const COLUMNS: &[&str] = &[
     "max_restarts",
     "messages",
     "mis",
+    "one_pc",
+    "deltas",
     "invariant_ok",
     "serializable",
     "violations",
@@ -362,6 +364,8 @@ impl Rec {
             .set("max_restarts", calls.iter().map(|c| c.restarts).max().unwrap_or(0))
             .set("messages", st.messages)
             .set("mis", st.mis)
+            .set("one_pc", st.one_pc)
+            .set("deltas", st.deltas_issued)
     }
 }
 

@@ -8,7 +8,11 @@ fn compile(src: &str) -> Program {
 }
 
 fn sim(p: &Program, mode: ExecMode, rows: i64) -> Sim {
-    let cfg = ClusterConfig { shards: 3, mode, seed: 3, table_ranges: vec![(0, 1, rows), (1, 0, 100)], ..Default::default() };
+    sim_rule(p, mode, rows, ConflictRule::WoundWait)
+}
+
+fn sim_rule(p: &Program, mode: ExecMode, rows: i64, rule: ConflictRule) -> Sim {
+    let cfg = ClusterConfig { shards: 3, mode, rule, seed: 3, table_ranges: vec![(0, 1, rows), (1, 0, 100)], ..Default::default() };
     let mut s = Sim::new(p.clone(), cfg).unwrap();
     s.load((1..=rows).map(|i| (Key { table: 0, pk: i }, vec![Value::Int(i), Value::Int(10)])));
     s
@@ -41,7 +45,7 @@ BEGIN
 END p;
 /"
     ));
-    for mode in ExecMode::all() {
+    for mode in ExecMode::extended() {
         let mut s = sim(&p, mode, 10);
         let st = s.call(0, Call::new("p", &[]));
         assert_eq!(st.result.unwrap_err().0, errcode::FETCH_OUT_OF_SEQUENCE, "{}", mode.name());
@@ -64,7 +68,7 @@ BEGIN
 END p;
 /"
     ));
-    for mode in ExecMode::all() {
+    for mode in ExecMode::extended() {
         let mut s = sim(&p, mode, 10);
         assert!(s.call(0, Call::new("p", &[])).result.is_ok());
         for k in 1..=5 {
@@ -97,7 +101,7 @@ BEGIN
 END p;
 /"
     ));
-    for mode in ExecMode::all() {
+    for mode in ExecMode::extended() {
         let mut s = sim(&p, mode, 10);
         let st = s.call(0, Call::new("p", &[1]));
         assert_eq!(st.result.unwrap_err().0, -20009);
@@ -118,7 +122,7 @@ fn snapshot_audit_always_sees_constant_total_fuzz() {
     let p = compile(&src);
     let n: i64 = 60;
     for seed in 1..=12u64 {
-        for mode in ExecMode::all() {
+        for mode in ExecMode::extended() {
             for rule in [ConflictRule::WoundWait, ConflictRule::WaitDie] {
                 let cfg = ClusterConfig {
                     shards: 1 + (seed as usize % 5),
@@ -194,4 +198,78 @@ fn checker_catches_a_deliberately_broken_engine() {
         }
     }
     assert!(caught >= 4, "checker missed the injected bug in {} of 5 runs", 5 - caught);
+}
+
+#[test]
+fn one_phase_commit_on_single_shard_block() {
+    let src = std::fs::read_to_string(format!("{}/../../workloads/bank.sql", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let p = compile(&src);
+    let mut lat = vec![];
+    for mode in [ExecMode::v1(), ExecMode::v1().with_fast_path()] {
+        let cfg = ClusterConfig { shards: 3, mode, table_ranges: vec![(0, 0, 299), (1, 0, 10_000_000)], ..Default::default() };
+        let mut s = Sim::new(p.clone(), cfg).unwrap();
+        s.load((0..300).map(|i| (Key { table: 0, pk: i }, vec![Value::Int(i), Value::Int(100), Value::Null])));
+        let st = s.call(2, Call::new("deposit", &[150, 7]));
+        assert!(st.result.is_ok());
+        assert_eq!(s.committed(Key { table: 0, pk: 150 }).unwrap()[1], Value::Int(107));
+        ok_serial(&s);
+        println!("{:10} deposit {:6.1} us, 1pc commits {}", mode.name(), st.latency_ns() as f64 / 1000.0, s.stats.one_pc);
+        lat.push(st.latency_ns());
+        if mode.fast_path {
+            assert_eq!(s.stats.one_pc, 1);
+        }
+    }
+    assert!(lat[1] < lat[0], "1PC must be faster for a single-shard deposit");
+}
+
+#[test]
+fn escrow_hot_counter_is_exact_and_conflict_free() {
+    let p = compile(&format!(
+        "{SCHEMA}
+CREATE OR REPLACE PROCEDURE inc(p_id IN NUMBER, p_n IN NUMBER) IS
+BEGIN
+  UPDATE t SET v = v + p_n WHERE id = p_id;
+  UPDATE t SET v = v - 1 WHERE id = p_id + 1;
+END inc;
+/
+CREATE OR REPLACE PROCEDURE rd(p_id IN NUMBER) IS
+  x NUMBER;
+  y NUMBER;
+BEGIN
+  SELECT v INTO x FROM t WHERE id = p_id;
+  SELECT v INTO y FROM t WHERE id = p_id + 1;
+  DBMS_OUTPUT.PUT_LINE(x + y);
+END rd;
+/"
+    ));
+    for rule in [ConflictRule::WoundWait, ConflictRule::WaitDie] {
+        for mode in [ExecMode::v1(), ExecMode::v1().with_escrow(), ExecMode::speculative().with_fast_path().with_escrow()] {
+            let mut s = sim_rule(&p, mode, 10, rule);
+            let mut gen = |r: &mut Rng, _c: usize| {
+                if r.chance(0.1) {
+                    Call::new("rd", &[1])
+                } else {
+                    Call::new("inc", &[1, 1])
+                }
+            };
+            let rep = s.run_closed_loop(48, 4_000_000, 0, &mut gen);
+            let incs = rep.calls.iter().filter(|c| c.proc == "inc" && c.result.is_ok()).count() as i64;
+            assert_eq!(v(&s, 1), Some(10 + incs), "{} {:?}", mode.name(), rule);
+            assert_eq!(v(&s, 2), Some(10 - incs));
+            for c in rep.calls.iter().filter(|c| c.proc == "rd") {
+                assert_eq!(c.output, vec!["20".to_string()], "{}: a reader saw half of a transaction", mode.name());
+            }
+            ok_serial(&s);
+            println!(
+                "{:28} {:?} inc ok {:5} thr {:8.0}/s restarts w{} d{} deltas {}",
+                mode.name(),
+                rule,
+                incs,
+                rep.throughput(),
+                rep.stats.restart_wounded,
+                rep.stats.restart_died,
+                rep.stats.deltas_issued
+            );
+        }
+    }
 }

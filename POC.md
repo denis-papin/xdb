@@ -107,6 +107,99 @@ Full tables: [bench/results.md](bench/results.md) (101 runs, all serializable, a
     - With blocks of 1000 rows, transfer p99 rises to 397 µs, and the batch is restarted about 120 times.
     - This confirms the §7.4 guidance of 100–10,000 rows per block, leaning to the low end when OLTP shares the data.
 
+### Improvements study (section 7 of `bench/results.md`)
+
+Modes compared:
+- `v1`: the proven baseline.
+- `+1pc`: one-phase commit for single-shard blocks, plus refresh only of the shards actually read. Proven.
+- `+escrow`: commutative updates. Experiment.
+
+Escrow turns `UPDATE t SET c = c + x` (or `c - x`, with `x` known when the statement runs) into a **delta**. Deltas on the same row from different transactions do not conflict with each other. They still conflict with reads and normal writes, like intents, and are applied in commit-timestamp order. When a delta commits below one already applied, the later values are recomputed; no reader can have seen them, because readers wait for pending deltas.
+
+All 155 benchmark runs and the extended test suite (now run in all 10 modes) are serializable. A dedicated test hammers one counter with 48 clients: the final value is exact, and no reader ever sees half of a transaction.
+
+| calls/s (3 shards, 64 clients) | v1 | v1+1pc | v1+escrow | v1+1pc+escrow | speculative | speculative+1pc+escrow |
+|---|---|---|---|---|---|---|
+| bank, 10,000 accounts (low contention) | 249k | 250k | 250k | 250k | 250k | 251k |
+| bank, 100 accounts | 91k | 92k | 157k | 161k | 83k | **183k** |
+| bank, 10 accounts (hot spot) | 13.2k | 13.7k | 23.8k | 24.8k | 13.0k | **41.6k** |
+| TPC-C lite, 1 warehouse | 10.7k | 10.5k | 30.4k | 31.4k | 11.3k | **40.1k** |
+| TPC-C lite, 4 warehouses | 41.5k | 40.9k | 85.3k | 89.4k | 43.1k | **114.5k** |
+
+11. **One-phase commit is a latency fix, not a throughput fix.**
+    - A single-shard block (deposit) drops from 203 to 148 µs (−27%). Multi-shard calls (transfer, payment) are unchanged.
+    - Under load, throughput is unchanged. Those clusters are limited by shard CPU, and most bank and TPC-C transactions touch several shards.
+    - The 1-shard bank run is CPU-saturated in every mode (≈121k calls/s), so it can't show a difference.
+    - Keep it: it is cheap and proven, and real applications designed for co-location (§6.1) have many single-shard blocks.
+12. **Escrow is the biggest win of the whole POC on contended data.**
+    - TPC-C with 1 warehouse goes from 10.7k to 30.4k calls/s (×2.8). The hot `ytd` counters stop serializing payments.
+    - Bank at 100 accounts: ×1.7. At 10 accounts: ×1.8.
+    - No effect without contention, as expected.
+    - Cost: the tail gets worse on the extreme hot spot (bank, 10 accounts: p99 7.1 → 10.7 ms). Transfers read a balance before updating it, and those reads must wait for the pending deltas of more concurrent writers.
+13. **The three ideas add up.**
+    - Speculation shortens the time intents are held, escrow removes counter conflicts, and 1PC trims single-shard commits.
+    - Together they give the best result on every contended workload: ×3.1 to ×3.8 throughput (bank hot spot 13.2k → 41.6k; TPC-C 1 warehouse 10.7k → 40.1k) and the best p99 (bank hot spot 3.98 ms vs 7.1 ms).
+    - Speculation alone helps little under contention, but combined with escrow it more than doubles escrow's gain on the hot spot (23.8k → 41.6k).
+
+**Recommendation.** Ship `+1pc` in the proven core. Keep escrow and speculation as switchable experiments, but treat escrow as the first experiment to harden: it gives the largest measured gain on contended data.
+
+Escrow limitations in the POC:
+- No bounds check. O'Neil's full escrow also guarantees, for example, `balance ≥ 0` without reading the row. Here a transaction that needs the value still reads it, and that read is validated normally.
+- Only `c = c ± constant` is recognized.
+- The final value of a delta is not returned to the statement. That's fine for `UPDATE`; a `RETURNING` clause would need the read.
+
+## Road to product
+
+The tests prove the **design** is sound. They do not prove that a **product** built on it would be. This is the order I would follow; each step keeps your three principles (Oracle-like behaviour, fast on a small LAN, proven techniques).
+
+### Step 0 — keep the simulator as the main test tool
+
+Build the real node so the same code runs either inside the simulator or on real sockets and disks. The core logic must not do its own I/O: it receives messages, clock ticks and disk completions, and returns messages and disk writes to send. FoundationDB is built this way and credits it for its reliability. Every protocol bug is then found in simulation, deterministically, with a seed you can replay.
+
+### Step 1 — durability and failures, in simulation
+
+- Replace the replication-latency model with real Raft (`raft-rs`, as TiKV uses), one group per shard.
+- Inject faults at every step: node crash and restart, lost and duplicated messages, network partitions, a disk write lost before fsync, leader change in the middle of a commit.
+- Add clock skew and the HLC uncertainty window (§10.6).
+- Exit criterion: weeks of simulated time per night, zero checker violations, zero lost committed writes.
+
+### Step 2 — stronger tests
+
+- **Client-side checking.** Today the engine records its own history, so a bug in the recorder could hide a bug in the engine. Add workloads where clients alone can see every anomaly (Jepsen's Elle: append-only lists and read-your-writes registers), and check only what clients observed.
+- **Mutation testing.** Inject dozens of deliberate protocol bugs, one at a time: skip a wound, drop a refresh span, resolve an intent at the wrong timestamp, lose a resolve message, reorder a channel. Each one must make a test fail. The POC has one such mutation.
+- Close the known holes: protect the "row exists" read behind `DUP_VAL_ON_INDEX`, and make handler rollback statement-level.
+
+### Step 3 — real nodes
+
+- One process per node, in Docker containers on a LAN, with a binary wire protocol.
+- Run Jepsen-style tests on real networks (partitions with `iptables`, killed processes, clock jumps).
+- Measure real latency and compare it with the simulation model; recalibrate the model.
+
+### Step 4 — product features
+
+These are proven, but large:
+- secondary indexes;
+- joins and a real SQL optimizer;
+- online schema change;
+- MVCC garbage collection and "snapshot too old";
+- backup and restore;
+- rolling upgrades;
+- authentication;
+- observability.
+
+Each comes with its own simulated tests.
+
+### Design improvements found by the POC
+
+| Improvement | Proven in | Status |
+|---|---|---|
+| Randomized restart backoff (wait-die livelock) | Every database that restarts on conflict | **Done** in the POC |
+| One-phase commit when a block's writes all go to one shard | CockroachDB 1PC | **Done** (`+1pc`): single-shard block −27% latency; no throughput change (findings 11–13) |
+| Refresh only the shards that were actually read | CockroachDB refresh spans | **Done**, part of `+1pc` |
+| Stage the commit in parallel with the last writes | CockroachDB parallel commits | **Not cheap.** A staged transaction can no longer be wounded. If one of its in-flight writes then waits for an older transaction, the two wait for each other. CockroachDB avoids this with a "transaction recovery" protocol (others check whether all writes landed, and if not, prevent the missing one and abort). Step 1 material. |
+| Per-key wait queues instead of re-polling parked operations | CockroachDB lock table | Step 1 material |
+| Commutative updates (escrow, O'Neil 1986) for hot counters | Research, not in mainstream SQL engines | **Experiment** (`+escrow`): ×2–3 throughput on contended workloads, serializable in every test (findings 11–13) |
+
 ## What is not proven by this POC
 
 - Behaviour on real machines and a real network (compromise 1). The next step would be one process per node in Docker containers, with real Raft (`raft-rs`), on the same tests.

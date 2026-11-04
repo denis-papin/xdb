@@ -1,6 +1,6 @@
 //! xdb-bench: runs the POC experiments and writes `results.md` and `results.csv`.
 //!
-//! Usage: xdb-bench [--out <dir>] [--quick] [--only <1..6>[,..]]
+//! Usage: xdb-bench [--out <dir>] [--quick] [--only <1..7>[,..]]
 //!
 //! Every run is a fresh deterministic simulation; every run that executes
 //! transactions is checked by xdb-checker. Exit code 1 if any run is not
@@ -170,14 +170,21 @@ fn exp4(o: &Opts, recs: &mut Vec<Rec>) {
     eprintln!("== 4. TPC-C lite");
     for w in [1, 4] {
         for mode in ExecMode::all() {
-            let t0 = Instant::now();
             let s = Setup { mode, seed: SEED, ..Default::default() };
-            let mut sim = tpcc_sim(&s, w);
+            recs.push(tpcc_run("4-tpcc", &format!("tpcc {w}w {}", mode.name()), &s, w, o.dur(100)));
+        }
+    }
+}
+
+fn tpcc_run(exp: &str, label: &str, s: &Setup, w: i64, dur: u64) -> Rec {
+    {
+        {
+            let t0 = Instant::now();
+            let mut sim = tpcc_sim(s, w);
             let mut gen = |r: &mut Rng, _c: usize| tpcc_call(r, w);
-            let dur = o.dur(100);
             let rep = sim.run_closed_loop(CLIENTS, dur, 0, &mut gen);
-            let mut rec = Rec::new("4-tpcc", &format!("tpcc {w}w {}", mode.name()));
-            rec.setup(&s).set("workload", "tpcc_lite").set("clients", CLIENTS).set("warehouses", w).report(&rep, dur);
+            let mut rec = Rec::new(exp, label);
+            rec.setup(s).set("workload", "tpcc_lite").set("clients", CLIENTS).set("warehouses", w).report(&rep, dur);
             let by = |p: &'static str| rep.calls.iter().filter(move |c| c.proc == p);
             rec.setf("new_order_p50_us", lat_us(by("new_order"), 50.0))
                 .setf("new_order_p99_us", lat_us(by("new_order"), 99.0))
@@ -203,7 +210,47 @@ fn exp4(o: &Opts, recs: &mut Vec<Rec>) {
             }
             rec.set("invariant_ok", inv);
             finish(&mut rec, &sim, t0);
-            recs.push(rec);
+            rec
+        }
+    }
+}
+
+/// The improvements of the "road to product" study, against the v1 baseline:
+/// one-phase commit + targeted refresh (proven) and escrow (experiment).
+fn improvement_modes() -> Vec<ExecMode> {
+    vec![
+        ExecMode::v1(),
+        ExecMode::v1().with_fast_path(),
+        ExecMode::v1().with_escrow(),
+        ExecMode::v1().with_fast_path().with_escrow(),
+        ExecMode::speculative(),
+        ExecMode::speculative().with_fast_path().with_escrow(),
+    ]
+}
+
+fn exp7(o: &Opts, recs: &mut Vec<Rec>) {
+    eprintln!("== 7. improvements: 1PC fast path, escrow");
+    for mode in improvement_modes() {
+        let s = Setup { mode, seed: SEED, ..Default::default() };
+        let n = mode.name();
+        // Idle: single-shard deposit (1PC case), cross-shard transfer, TPC-C payment.
+        let call = Call::new("deposit", &[150, 7]);
+        let mut r = idle("7-idle", &format!("deposit idle {n}"), &s, bank_sim(&s, BANK_ACC_IDLE), 2, &call, o.idle_reps(), "bank");
+        r.set("accounts", BANK_ACC_IDLE);
+        recs.push(r);
+        recs.push(idle_transfer("7-idle", &s, o.idle_reps()));
+        let pay = Call::new("payment", &[0, 5, 7, 100]);
+        let mut r = idle("7-idle", &format!("payment idle {n}"), &s, tpcc_sim(&s, 1), 0, &pay, o.idle_reps(), "tpcc_lite");
+        r.set("warehouses", 1);
+        recs.push(r);
+        // Load: bank at three contention levels, 1-shard bank, TPC-C 1 and 4 warehouses.
+        for n_acc in [10_000, 100, 10] {
+            recs.push(bank_run("7-load", &format!("bank {n_acc} acc {n}"), &s, n_acc, CLIENTS, o.dur(100)));
+        }
+        let s1 = Setup { shards: 1, ..s.clone() };
+        recs.push(bank_run("7-load", &format!("bank 1 shard {n}"), &s1, 10_000, CLIENTS, o.dur(100)));
+        for w in [1, 4] {
+            recs.push(tpcc_run("7-load", &format!("tpcc {w}w {n}"), &s, w, o.dur(100)));
         }
     }
 }
@@ -435,6 +482,36 @@ Commit waits for a majority of replicas (leader included): 2 replicas = both, 3 
         "6-batch",
         &batch_cols,
     );
+
+    section(
+        &mut md,
+        "7a. Improvements — idle latency",
+        "Same idle calls as section 1 (3 shards x 3 replicas), comparing the v1 baseline with the one-phase-commit fast path (`+1pc`, proven) and commutative updates (`+escrow`, experiment). The deposit touches one shard (the 1PC case); the transfer and the payment touch several.",
+        recs,
+        "7-idle",
+        &idle_cols,
+    );
+    let imp_cols = [
+        ("label", "run"),
+        ("mode", "mode"),
+        ("throughput", "calls/s"),
+        ("p50_us", "p50 us"),
+        ("p99_us", "p99 us"),
+        ("new_order_p99_us", "new_order p99"),
+        ("payment_p99_us", "payment p99"),
+        ("aborts_per_commit", "aborts/commit"),
+        ("one_pc", "1PC commits"),
+        ("deltas", "deltas"),
+        ("serializable", "serializable"),
+    ];
+    section(
+        &mut md,
+        "7b. Improvements — under load",
+        "64 clients, 3 shards x 3 replicas unless noted: bank mix at low (10,000 accounts), high (100) and hotspot (10) contention, bank on 1 shard (every block qualifies for 1PC), TPC-C lite with 1 warehouse (hot `ytd` counters) and 4.",
+        recs,
+        "7-load",
+        &imp_cols,
+    );
     md
 }
 
@@ -442,7 +519,8 @@ fn main() {
     let o = parse_args();
     let t0 = Instant::now();
     let mut recs: Vec<Rec> = vec![];
-    let exps: [(u32, fn(&Opts, &mut Vec<Rec>)); 6] = [(1, exp1), (2, exp2), (3, exp3), (4, exp4), (5, exp5), (6, exp6)];
+    let exps: [(u32, fn(&Opts, &mut Vec<Rec>)); 7] =
+        [(1, exp1), (2, exp2), (3, exp3), (4, exp4), (5, exp5), (6, exp6), (7, exp7)];
     for (n, f) in exps {
         if o.only.is_empty() || o.only.contains(&n) {
             f(&o, &mut recs);

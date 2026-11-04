@@ -1,19 +1,28 @@
 //! A shard leader: MVCC storage, write intents, read-timestamp cache and the
 //! priority-based conflict rules (§5 of the design doc). One core serves its
 //! micro-instructions one at a time, highest priority first.
+//!
+//! Experiment: commutative "delta" intents (escrow, O'Neil 1986). `c = c + x` updates
+//! from different transactions do not conflict with each other; they conflict with
+//! reads and normal writes like intents do, and are applied in commit-timestamp order.
 
 use crate::config::ConflictRule;
 use crate::eval::{eval, RowEnv};
 use crate::types::*;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
-use xdb_ir::{errcode, ColId, Expr, Key, Row, TableId, Ts, TxnId};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use xdb_ir::{errcode, ColId, Expr, Key, Row, TableId, Ts, TxnId, Value};
+
+pub type Delta = Vec<(ColId, i64)>;
 
 #[derive(Clone, Debug)]
 pub struct Version {
     pub ts: Ts,
     pub value: Option<Row>,
     pub writer: Option<TxnId>,
+    /// Set when this version was produced by a delta: its value is recomputed if an
+    /// earlier delta commits later (retroactively, below it).
+    pub delta: Option<Delta>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,17 +35,48 @@ pub struct Intent {
     pub stack: Vec<(u32, Option<Row>)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct DeltaIntent {
+    pub txn: TxnId,
+    pub ts: Ts,
+    pub prio: Priority,
+    pub stack: Vec<(u32, Delta)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Record {
     /// Committed versions, ascending timestamp.
     pub versions: Vec<Version>,
     pub intent: Option<Intent>,
+    pub deltas: Vec<DeltaIntent>,
 }
 
 impl Record {
     fn at(&self, ts: Ts) -> Option<&Version> {
         self.versions.iter().rev().find(|v| v.ts <= ts)
     }
+}
+
+fn merge(stack: &[(u32, Delta)]) -> Delta {
+    let mut m: BTreeMap<ColId, i64> = BTreeMap::new();
+    for (_, d) in stack {
+        for (c, x) in d {
+            *m.entry(*c).or_insert(0) += x;
+        }
+    }
+    m.into_iter().collect()
+}
+
+fn apply_delta(row: &Option<Row>, d: &[(ColId, i64)]) -> Option<Row> {
+    row.as_ref().map(|r| {
+        let mut r = r.clone();
+        for (c, x) in d {
+            if let Value::Int(v) = r[*c as usize] {
+                r[*c as usize] = Value::Int(v.saturating_add(*x));
+            }
+        }
+        r
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +118,9 @@ pub struct ShardStats {
     pub dies: u64,
     pub pushes: u64,
     pub refresh_fail: u64,
+    pub deltas: u64,
+    pub one_pc_ok: u64,
+    pub one_pc_fail: u64,
 }
 
 pub struct Done {
@@ -89,15 +132,32 @@ pub struct Done {
     pub wrote: bool,
     /// Rows scanned (for CPU cost).
     pub rows: usize,
+    /// No response to send now (a one-phase commit answers after replication).
+    pub silent: bool,
 }
 
 enum Step {
     Done(MiResult, Option<Ts>, bool, usize),
+    Silent,
     Park(Key),
 }
 
 enum Conf {
     Go,
+    Park,
+    Die,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Read,
+    Write,
+    Delta,
+}
+
+enum Act {
+    Retry,
+    Skip,
     Park,
     Die,
 }
@@ -114,6 +174,12 @@ pub struct Shard {
     blocked: HashMap<TxnId, (u32, Vec<Mi>)>,
     ready: BinaryHeap<Ready>,
     cancelled: HashMap<TxnId, Vec<(u32, u32)>>,
+    /// Highest timestamp a transaction's writes were pushed above on this shard.
+    txn_push: HashMap<TxnId, Ts>,
+    /// Transactions whose write failed here (blocks a one-phase commit).
+    txn_err: HashSet<TxnId>,
+    /// Final values of delta writes, for the history: (writer, key, value).
+    pub patches: Vec<(TxnId, Key, Option<Row>)>,
     pub busy: bool,
     pub stats: ShardStats,
     rule: ConflictRule,
@@ -132,6 +198,9 @@ impl Shard {
             blocked: HashMap::new(),
             ready: BinaryHeap::new(),
             cancelled: HashMap::new(),
+            txn_push: HashMap::new(),
+            txn_err: HashSet::new(),
+            patches: Vec::new(),
             busy: false,
             stats: ShardStats::default(),
             rule,
@@ -144,6 +213,7 @@ impl Shard {
             ts: Ts::default(),
             value: Some(row),
             writer: None,
+            delta: None,
         });
     }
 
@@ -211,6 +281,8 @@ impl Shard {
             ShardOp::Update { key, sets } => self.write_like(&mi, *key, WK::Update(sets), g, out),
             ShardOp::Insert { key, row } => self.write_like(&mi, *key, WK::Insert(row), g, out),
             ShardOp::Delete { key } => self.write_like(&mi, *key, WK::Delete, g, out),
+            ShardOp::Delta { key, adds } => self.delta(&mi, *key, adds, g, out),
+            ShardOp::Commit1PC => self.one_pc(&mi, g, out),
             ShardOp::Scan { table, lo, hi, filter, limit, for_update } => {
                 self.scan(&mi, *table, *lo, *hi, filter.as_ref(), *limit, *for_update, g, out)
             }
@@ -222,71 +294,113 @@ impl Shard {
                 self.parked.entry(key).or_default().push(mi);
                 None
             }
-            Step::Done(result, push, wrote, rows) => {
+            Step::Done(..) | Step::Silent => {
                 if self.blocked.get(&mi.txn.id).map_or(false, |b| b.0 == mi.seq) {
                     self.unblock(mi.txn.id);
                 }
-                if push.is_some() {
+                let (result, push, wrote, rows, silent) = match step {
+                    Step::Done(r, p, w, n) => (r, p, w, n, false),
+                    _ => (MiResult::OnePc { ok: true }, None, false, 0, true),
+                };
+                if let Some(p) = push {
                     self.stats.pushes += 1;
+                    let e = self.txn_push.entry(mi.txn.id).or_insert(p);
+                    if p > *e {
+                        *e = p;
+                    }
                 }
-                Some(Done { mi_seq: mi.seq, txn: mi.txn, result, push_above: push, wrote, rows })
+                if matches!(result, MiResult::Err(_)) {
+                    self.txn_err.insert(mi.txn.id);
+                }
+                Some(Done { mi_seq: mi.seq, txn: mi.txn, result, push_above: push, wrote, rows, silent })
             }
         }
     }
 
     // ---------------------------------------------------------------- conflicts
 
-    fn conflict(&mut self, key: Key, me: &TxnMeta, write: bool, g: &mut Global, out: &mut Vec<Out>) -> Conf {
-        loop {
-            let Some(int) = self.data.get(&key).and_then(|r| r.intent.as_ref()) else {
-                return Conf::Go;
+    fn wound(&mut self, h: TxnId, g: &mut Global, out: &mut Vec<Out>) {
+        self.stats.wounds += 1;
+        g.set(h, Status::Aborted);
+        if let Some(hs) = g.txns.get(&h) {
+            out.push(Out {
+                to: Ep::Coord(hs.node),
+                msg: Msg::C(ToCoord::Wounded { sid: hs.sid, txn: h }),
+                extra_ns: 0,
+                after_replication: false,
+            });
+        }
+    }
+
+    /// Decide what to do about another transaction `h`'s intent (or delta) on `key`.
+    #[allow(clippy::too_many_arguments)]
+    fn decide(
+        &mut self,
+        key: Key,
+        h: TxnId,
+        its: Ts,
+        hprio: Priority,
+        me: &TxnMeta,
+        write: bool,
+        g: &mut Global,
+        out: &mut Vec<Out>,
+    ) -> Act {
+        match g.status(h) {
+            Status::Committed(cts) => {
+                self.resolve_key(key, h, cts);
+                Act::Retry
+            }
+            Status::Aborted => {
+                self.drop_intent(key, h);
+                Act::Retry
+            }
+            Status::Staging => {
+                if !write && its > me.read_ts {
+                    Act::Skip
+                } else {
+                    Act::Park
+                }
+            }
+            Status::Running => {
+                if !write && its > me.read_ts {
+                    return Act::Skip;
+                }
+                let me_older = me.prio < hprio;
+                match (self.rule, me_older) {
+                    (ConflictRule::WoundWait, true) => {
+                        self.wound(h, g, out);
+                        self.drop_intent(key, h);
+                        Act::Retry
+                    }
+                    (ConflictRule::WoundWait, false) => Act::Park,
+                    (ConflictRule::WaitDie, true) => Act::Park,
+                    (ConflictRule::WaitDie, false) => {
+                        self.stats.dies += 1;
+                        Act::Die
+                    }
+                }
+            }
+        }
+    }
+
+    fn conflict(&mut self, key: Key, me: &TxnMeta, mode: Mode, g: &mut Global, out: &mut Vec<Out>) -> Conf {
+        'outer: loop {
+            let Some(rec) = self.data.get(&key) else { return Conf::Go };
+            let full = rec.intent.as_ref().filter(|i| i.txn != me.id).map(|i| (i.txn, i.ts, i.prio));
+            let others: Vec<(TxnId, Ts, Priority)> = if mode == Mode::Delta {
+                vec![]
+            } else {
+                rec.deltas.iter().filter(|d| d.txn != me.id).map(|d| (d.txn, d.ts, d.prio)).collect()
             };
-            if int.txn == me.id {
-                return Conf::Go;
-            }
-            let (h, its, hprio) = (int.txn, int.ts, int.prio);
-            match g.status(h) {
-                Status::Committed(cts) => self.resolve_key(key, h, cts),
-                Status::Aborted => self.drop_intent(key, h),
-                Status::Staging => {
-                    if !write && its > me.read_ts {
-                        return Conf::Go;
-                    }
-                    return Conf::Park;
-                }
-                Status::Running => {
-                    if !write && its > me.read_ts {
-                        return Conf::Go;
-                    }
-                    let me_older = me.prio < hprio;
-                    match self.rule {
-                        ConflictRule::WoundWait => {
-                            if me_older {
-                                self.stats.wounds += 1;
-                                g.set(h, Status::Aborted);
-                                if let Some(hs) = g.txns.get(&h) {
-                                    out.push(Out {
-                                        to: Ep::Coord(hs.node),
-                                        msg: Msg::C(ToCoord::Wounded { sid: hs.sid, txn: h }),
-                                        extra_ns: 0,
-                                        after_replication: false,
-                                    });
-                                }
-                                self.drop_intent(key, h);
-                            } else {
-                                return Conf::Park;
-                            }
-                        }
-                        ConflictRule::WaitDie => {
-                            if me_older {
-                                return Conf::Park;
-                            }
-                            self.stats.dies += 1;
-                            return Conf::Die;
-                        }
-                    }
+            for (h, its, hp) in full.into_iter().chain(others) {
+                match self.decide(key, h, its, hp, me, mode != Mode::Read, g, out) {
+                    Act::Retry => continue 'outer,
+                    Act::Skip => {}
+                    Act::Park => return Conf::Park,
+                    Act::Die => return Conf::Die,
                 }
             }
+            return Conf::Go;
         }
     }
 
@@ -295,8 +409,26 @@ impl Shard {
             if rec.intent.as_ref().map_or(false, |i| i.txn == h) {
                 let int = rec.intent.take().unwrap();
                 let value = int.stack.last().and_then(|(_, v)| v.clone());
-                rec.versions.push(Version { ts: cts, value, writer: Some(h) });
-                debug_assert!(rec.versions.windows(2).all(|w| w[0].ts < w[1].ts));
+                debug_assert!(rec.versions.last().map_or(true, |v| v.ts < cts));
+                rec.versions.push(Version { ts: cts, value, writer: Some(h), delta: None });
+            }
+            if let Some(pos) = rec.deltas.iter().position(|d| d.txn == h) {
+                let d = rec.deltas.remove(pos);
+                let sum = merge(&d.stack);
+                let at = rec.versions.partition_point(|v| v.ts < cts);
+                let base = if at > 0 { rec.versions[at - 1].value.clone() } else { None };
+                let value = apply_delta(&base, &sum);
+                rec.versions.insert(at, Version { ts: cts, value: value.clone(), writer: Some(h), delta: Some(sum) });
+                self.patches.push((h, key, value));
+                // Later delta versions committed earlier in real time: recompute.
+                for i in at + 1..rec.versions.len() {
+                    let Some(dv) = rec.versions[i].delta.clone() else { break };
+                    let v = apply_delta(&rec.versions[i - 1].value, &dv);
+                    rec.versions[i].value = v.clone();
+                    if let Some(w) = rec.versions[i].writer {
+                        self.patches.push((w, key, v));
+                    }
+                }
             }
         }
         if let Some(ks) = self.txn_keys.get_mut(&h) {
@@ -310,11 +442,39 @@ impl Shard {
             if rec.intent.as_ref().map_or(false, |i| i.txn == h) {
                 rec.intent = None;
             }
+            rec.deltas.retain(|d| d.txn != h);
         }
         if let Some(ks) = self.txn_keys.get_mut(&h) {
             ks.remove(&key);
         }
         self.wake(key);
+    }
+
+    /// Turn my own pending delta on `key` into a normal intent (before a normal write).
+    /// The caller has already resolved every other transaction's delta on the key.
+    fn materialize(&mut self, key: Key, me: TxnId) {
+        let Some(rec) = self.data.get_mut(&key) else { return };
+        let Some(pos) = rec.deltas.iter().position(|d| d.txn == me) else { return };
+        let d = rec.deltas.remove(pos);
+        let mut v = rec.versions.last().and_then(|x| x.value.clone());
+        let mut stack = vec![];
+        for (seq, dd) in &d.stack {
+            v = apply_delta(&v, dd);
+            stack.push((*seq, v.clone()));
+        }
+        rec.intent = Some(Intent { txn: me, ts: d.ts, prio: d.prio, stack });
+    }
+
+    /// What `me` sees in `rec` at `ts`: own intent, else committed version + own delta.
+    fn view(rec: &Record, me: TxnId, ts: Ts) -> (Option<Row>, Option<TxnId>) {
+        if let Some(i) = rec.intent.as_ref().filter(|i| i.txn == me) {
+            return (i.stack.last().unwrap().1.clone(), Some(me));
+        }
+        let (v, w) = rec.at(ts).map(|v| (v.value.clone(), v.writer)).unwrap_or((None, None));
+        match rec.deltas.iter().find(|d| d.txn == me) {
+            Some(d) => (apply_delta(&v, &merge(&d.stack)), Some(me)),
+            None => (v, w),
+        }
     }
 
     // ---------------------------------------------------------------- ts cache
@@ -342,6 +502,9 @@ impl Shard {
     }
 
     fn max_other_read(&self, key: Key, me: TxnId) -> Option<Ts> {
+        if self.fault_ignore_read_ts {
+            return None;
+        }
         let p = self
             .tscache
             .get(&key)
@@ -359,17 +522,14 @@ impl Shard {
 
     fn get(&mut self, mi: &Mi, key: Key, g: &mut Global, out: &mut Vec<Out>) -> Step {
         let me = &mi.txn;
-        match self.conflict(key, me, false, g, out) {
+        match self.conflict(key, me, Mode::Read, g, out) {
             Conf::Park => return Step::Park(key),
             Conf::Die => return self.die(me, g),
             Conf::Go => {}
         }
         let (value, writer) = match self.data.get(&key) {
             None => (None, None),
-            Some(rec) => match &rec.intent {
-                Some(i) if i.txn == me.id => (i.stack.last().unwrap().1.clone(), Some(me.id)),
-                _ => rec.at(me.read_ts).map(|v| (v.value.clone(), v.writer)).unwrap_or((None, None)),
-            },
+            Some(rec) => Self::view(rec, me.id, me.read_ts),
         };
         self.bump(key, me.read_ts, me.id);
         Step::Done(MiResult::Read { value, writer }, None, false, 1)
@@ -382,12 +542,13 @@ impl Shard {
 
     fn write_like(&mut self, mi: &Mi, key: Key, kind: WK, g: &mut Global, out: &mut Vec<Out>) -> Step {
         let me = mi.txn.clone();
-        match self.conflict(key, &me, true, g, out) {
+        match self.conflict(key, &me, Mode::Write, g, out) {
             Conf::Park => return Step::Park(key),
             Conf::Die => return self.die(&me, g),
             Conf::Go => {}
         }
-        let other_read = if self.fault_ignore_read_ts { None } else { self.max_other_read(key, me.id) };
+        self.materialize(key, me.id);
+        let other_read = self.max_other_read(key, me.id);
         let rec = self.data.entry(key).or_default();
         let own = rec.intent.as_ref().map_or(false, |i| i.txn == me.id);
         let (cur, cur_writer, latest_ts) = if own {
@@ -453,6 +614,84 @@ impl Shard {
         Step::Done(result, push, true, 1)
     }
 
+    /// Escrow: add `adds` to integer columns without reading the row.
+    fn delta(&mut self, mi: &Mi, key: Key, adds: &Delta, g: &mut Global, out: &mut Vec<Out>) -> Step {
+        let me = mi.txn.clone();
+        match self.conflict(key, &me, Mode::Delta, g, out) {
+            Conf::Park => return Step::Park(key),
+            Conf::Die => return self.die(&me, g),
+            Conf::Go => {}
+        }
+        let other_read = self.max_other_read(key, me.id);
+        let rec = self.data.entry(key).or_default();
+        if let Some(i) = rec.intent.as_mut().filter(|i| i.txn == me.id) {
+            // Already a normal writer of this row: just update the provisional value.
+            let top = i.stack.last().unwrap().1.clone();
+            let new = apply_delta(&top, adds);
+            i.stack.push((mi.seq, new.clone()));
+            return Step::Done(
+                MiResult::Write { new_value: new, applied: top.is_some(), prev: top, prev_writer: Some(me.id) },
+                None,
+                true,
+                1,
+            );
+        }
+        let own_delta = rec.deltas.iter().any(|d| d.txn == me.id);
+        let latest = rec.versions.last().map(|v| (v.ts, v.value.is_some()));
+        if !own_delta && !latest.map_or(false, |l| l.1) {
+            // Missing row: behave like a normal UPDATE (0 rows, absence locked).
+            return self.write_like(mi, key, WK::Update(&vec![]), g, out);
+        }
+        let mut push: Option<Ts> = None;
+        if !own_delta {
+            if let Some((lt, _)) = latest {
+                if lt >= me.write_ts {
+                    push = Some(lt);
+                }
+            }
+            if let Some(rt) = other_read {
+                if rt >= me.write_ts {
+                    push = push.max(Some(rt));
+                }
+            }
+        }
+        let its = match push {
+            Some(p) => me.write_ts.max(bumped(p)),
+            None => me.write_ts,
+        };
+        let rec = self.data.get_mut(&key).unwrap();
+        match rec.deltas.iter_mut().find(|d| d.txn == me.id) {
+            Some(d) => d.stack.push((mi.seq, adds.clone())),
+            None => rec.deltas.push(DeltaIntent { txn: me.id, ts: its, prio: me.prio, stack: vec![(mi.seq, adds.clone())] }),
+        }
+        self.txn_keys.entry(me.id).or_default().insert(key);
+        self.stats.deltas += 1;
+        Step::Done(MiResult::Delta { applied: true }, push, true, 1)
+    }
+
+    /// One-phase commit of a transaction whose writes are all on this shard and were
+    /// sent in the same batch. Processed after them (same transaction, higher seq).
+    fn one_pc(&mut self, mi: &Mi, g: &mut Global, out: &mut Vec<Out>) -> Step {
+        let me = &mi.txn;
+        let err = self.txn_err.remove(&me.id);
+        let pushed = self.txn_push.get(&me.id).map_or(false, |p| *p >= me.write_ts);
+        let ok = !err && !pushed && me.write_ts == me.read_ts && g.status(me.id) == Status::Running;
+        if !ok {
+            self.stats.one_pc_fail += 1;
+            return Step::Done(MiResult::OnePc { ok: false }, None, false, 0);
+        }
+        self.stats.one_pc_ok += 1;
+        // No wound from now on; commit once the batch is replicated.
+        g.set(me.id, Status::Staging);
+        out.push(Out {
+            to: Ep::Shard(self.id),
+            msg: Msg::S(ToShard::Finish1PC { txn: me.id, ts: me.write_ts, sid: me.sid, node: me.node }),
+            extra_ns: 0,
+            after_replication: true,
+        });
+        Step::Silent
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn scan(
         &mut self,
@@ -481,17 +720,13 @@ impl Shard {
         let mut hi_eff = hi;
         let mut n = 0usize;
         for k in keys {
-            match self.conflict(k, &me, false, g, out) {
+            match self.conflict(k, &me, Mode::Read, g, out) {
                 Conf::Park => return Step::Park(k),
                 Conf::Die => return self.die(&me, g),
                 Conf::Go => {}
             }
             n += 1;
-            let rec = &self.data[&k];
-            let (val, writer) = match &rec.intent {
-                Some(i) if i.txn == me.id => (i.stack.last().unwrap().1.clone(), Some(me.id)),
-                _ => rec.at(me.read_ts).map(|v| (v.value.clone(), v.writer)).unwrap_or((None, None)),
-            };
+            let (val, writer) = Self::view(&self.data[&k], me.id, me.read_ts);
             if let Some(row) = val {
                 seen.push((k.pk, writer));
                 let pass = match filter {
@@ -519,7 +754,7 @@ impl Shard {
         if for_update && !locks.is_empty() {
             // All conflicts must be resolved before any lock is placed.
             for k in &locks {
-                match self.conflict(*k, &me, true, g, out) {
+                match self.conflict(*k, &me, Mode::Write, g, out) {
                     Conf::Park => return Step::Park(*k),
                     Conf::Die => return self.die(&me, g),
                     Conf::Go => {}
@@ -562,17 +797,21 @@ impl Shard {
                     self.stats.refresh_fail += 1;
                     return false;
                 }
-                if let Some(i) = &rec.intent {
-                    if i.txn != me {
-                        let bad = match g.status(i.txn) {
-                            Status::Committed(c) => c > from && c <= to,
-                            Status::Aborted => false,
-                            _ => i.ts <= to,
-                        };
-                        if bad {
-                            self.stats.refresh_fail += 1;
-                            return false;
-                        }
+                let pending = rec
+                    .intent
+                    .iter()
+                    .map(|i| (i.txn, i.ts))
+                    .chain(rec.deltas.iter().map(|d| (d.txn, d.ts)))
+                    .filter(|(t, _)| *t != me);
+                for (t, its) in pending {
+                    let bad = match g.status(t) {
+                        Status::Committed(c) => c > from && c <= to,
+                        Status::Aborted => false,
+                        _ => its <= to,
+                    };
+                    if bad {
+                        self.stats.refresh_fail += 1;
+                        return false;
                     }
                 }
             }
@@ -598,12 +837,18 @@ impl Shard {
         }
     }
 
+    fn forget(&mut self, txn: TxnId) {
+        self.cancelled.remove(&txn);
+        self.txn_push.remove(&txn);
+        self.txn_err.remove(&txn);
+    }
+
     pub fn resolve(&mut self, txn: TxnId, cts: Ts) {
         let keys: Vec<Key> = self.txn_keys.remove(&txn).map(|s| s.into_iter().collect()).unwrap_or_default();
         for k in keys {
             self.resolve_key(k, txn, cts);
         }
-        self.cancelled.remove(&txn);
+        self.forget(txn);
     }
 
     pub fn abort(&mut self, txn: TxnId) {
@@ -612,7 +857,7 @@ impl Shard {
             self.drop_intent(k, txn);
         }
         self.cancel(txn, 0, u32::MAX);
-        self.cancelled.remove(&txn);
+        self.forget(txn);
         self.blocked.remove(&txn);
     }
 
@@ -620,16 +865,24 @@ impl Shard {
         self.cancel(txn, from_seq, to_seq);
         self.cancelled.entry(txn).or_default().push((from_seq, to_seq));
         let keys: Vec<Key> = self.txn_keys.get(&txn).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        let gone = |s: u32| s >= from_seq && s <= to_seq;
         for k in keys {
             let mut emptied = false;
             if let Some(rec) = self.data.get_mut(&k) {
                 if let Some(i) = &mut rec.intent {
                     if i.txn == txn {
-                        i.stack.retain(|(s, _)| *s < from_seq || *s > to_seq);
+                        i.stack.retain(|(s, _)| !gone(*s));
                         if i.stack.is_empty() {
                             rec.intent = None;
                             emptied = true;
                         }
+                    }
+                }
+                if let Some(pos) = rec.deltas.iter().position(|d| d.txn == txn) {
+                    rec.deltas[pos].stack.retain(|(s, _)| !gone(*s));
+                    if rec.deltas[pos].stack.is_empty() {
+                        rec.deltas.remove(pos);
+                        emptied = true;
                     }
                 }
             }
@@ -682,7 +935,7 @@ impl Shard {
     }
 
     pub fn pending_intents(&self) -> usize {
-        self.data.values().filter(|r| r.intent.is_some()).count()
+        self.data.values().filter(|r| r.intent.is_some() || !r.deltas.is_empty()).count()
     }
 }
 

@@ -104,6 +104,10 @@ pub enum ShardOp {
     /// Range read of `[lo, hi]` of `table` restricted to this shard. `filter` uses
     /// `Col(_, c)` for the row's columns; `limit` counts rows passing the filter.
     Scan { table: TableId, lo: i64, hi: i64, filter: Option<Expr>, limit: Option<u64>, for_update: bool },
+    /// Escrow: add these amounts to integer columns (commutative update).
+    Delta { key: Key, adds: Vec<(ColId, i64)> },
+    /// One-phase commit, after the same transaction's writes in this batch.
+    Commit1PC,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +115,10 @@ pub enum MiResult {
     Read { value: Option<Row>, writer: Option<TxnId> },
     Write { new_value: Option<Row>, applied: bool, prev: Option<Row>, prev_writer: Option<TxnId> },
     Scan { rows: Vec<Row>, seen: Vec<(i64, Option<TxnId>)>, hi_eff: i64 },
+    /// A delta was placed (`applied` = the row exists).
+    Delta { applied: bool },
+    /// Answer to `Commit1PC` when it could not commit (fall back to the normal path).
+    OnePc { ok: bool },
     Err(i32),
     Aborted,
 }
@@ -125,6 +133,8 @@ pub enum ToShard {
     Resolve { txn: TxnId, commit_ts: Ts },
     Abort { txn: TxnId },
     RollbackTo { txn: TxnId, from_seq: u32, to_seq: u32 },
+    /// Sent by a shard to itself once a one-phase commit batch is replicated.
+    Finish1PC { txn: TxnId, ts: Ts, sid: SessionId, node: NodeId },
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +146,7 @@ pub enum ToCoord {
     PrepareResp { sid: SessionId, txn: TxnId, ok: bool },
     CommitRecordResp { sid: SessionId, txn: TxnId },
     Wounded { sid: SessionId, txn: TxnId },
+    OnePcResp { sid: SessionId, txn: TxnId, ts: Ts },
 }
 
 #[derive(Clone, Debug)]

@@ -63,36 +63,71 @@ pub struct ExecMode {
     /// Parallel commit (one consensus round) instead of classic two-phase commit.
     /// Proven.
     pub parallel_commit: bool,
+    /// One-phase commit when all of a block's unsent writes and intents are on one
+    /// shard, and refresh only the shards actually read. Proven (CockroachDB 1PC,
+    /// refresh spans).
+    pub fast_path: bool,
+    /// Commutative updates (escrow, O'Neil 1986): `UPDATE t SET c = c + x` places a
+    /// delta that does not conflict with other deltas on the same row. Experiment.
+    pub escrow: bool,
 }
 
 impl ExecMode {
+    const fn base(pipelining: bool, lookahead: bool, speculation: bool, parallel_commit: bool) -> Self {
+        ExecMode { pipelining, lookahead, speculation, parallel_commit, fast_path: false, escrow: false }
+    }
     /// One statement at a time, classic 2PC.
     pub fn naive() -> Self {
-        ExecMode { pipelining: false, lookahead: false, speculation: false, parallel_commit: false }
+        Self::base(false, false, false, false)
     }
     /// Proven techniques only: pipelined writes, batching, parallel commit.
     pub fn v1() -> Self {
-        ExecMode { pipelining: true, lookahead: false, speculation: false, parallel_commit: true }
+        Self::base(true, false, false, true)
     }
     /// v1 + out-of-order issue of independent statements.
     pub fn parallel() -> Self {
-        ExecMode { pipelining: true, lookahead: true, speculation: false, parallel_commit: true }
+        Self::base(true, true, false, true)
     }
     /// parallel + speculation past guards.
     pub fn speculative() -> Self {
-        ExecMode { pipelining: true, lookahead: true, speculation: true, parallel_commit: true }
+        Self::base(true, true, true, true)
+    }
+    pub fn with_fast_path(mut self) -> Self {
+        self.fast_path = true;
+        self
+    }
+    pub fn with_escrow(mut self) -> Self {
+        self.escrow = true;
+        self
     }
     pub fn name(&self) -> &'static str {
-        match (self.pipelining, self.lookahead, self.speculation, self.parallel_commit) {
-            (false, false, false, false) => "naive",
-            (true, false, false, true) => "v1",
-            (true, true, false, true) => "parallel",
-            (true, true, true, true) => "speculative",
-            _ => "custom",
-        }
+        let base = match (self.pipelining, self.lookahead, self.speculation, self.parallel_commit) {
+            (false, false, false, false) => 0,
+            (true, false, false, true) => 1,
+            (true, true, false, true) => 2,
+            (true, true, true, true) => 3,
+            _ => return "custom",
+        };
+        const NAMES: [[&str; 4]; 4] = [
+            ["naive", "naive+1pc", "naive+escrow", "naive+1pc+escrow"],
+            ["v1", "v1+1pc", "v1+escrow", "v1+1pc+escrow"],
+            ["parallel", "parallel+1pc", "parallel+escrow", "parallel+1pc+escrow"],
+            ["speculative", "speculative+1pc", "speculative+escrow", "speculative+1pc+escrow"],
+        ];
+        NAMES[base][self.fast_path as usize + 2 * self.escrow as usize]
     }
     pub fn all() -> [ExecMode; 4] {
         [Self::naive(), Self::v1(), Self::parallel(), Self::speculative()]
+    }
+    /// Base modes plus the improvements of the "road to product" study.
+    pub fn extended() -> Vec<ExecMode> {
+        let mut v: Vec<ExecMode> = Self::all().to_vec();
+        for m in [Self::v1(), Self::speculative()] {
+            v.push(m.with_fast_path());
+            v.push(m.with_escrow());
+            v.push(m.with_fast_path().with_escrow());
+        }
+        v
     }
 }
 
